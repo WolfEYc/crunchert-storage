@@ -18,14 +18,6 @@ const PARTITIONS_FILE_HEADER_FILENAME: &str = "CruncheRTPartitionsConfig";
 const MIN_PTS_TO_COMPRESS: usize = 8192;
 const MIN_STREAMS_PER_THREAD: usize = 1024;
 
-pub struct AggChartRequest {
-    pub stream_ids: Vec<u64>,
-    pub start_unix_s: i64,
-    pub stop_unix_s: i64,
-    pub step_s: u32,
-    pub aggregation: i32,
-}
-
 #[derive(Clone, Copy)]
 pub enum Aggregation {
     Sum,
@@ -34,7 +26,7 @@ pub enum Aggregation {
     Max,
 }
 
-pub struct NonAggChartRequest {
+pub struct ChartRequest {
     pub stream_ids: Vec<u64>,
     pub start_unix_s: i64,
     pub stop_unix_s: i64,
@@ -131,16 +123,8 @@ fn resolution(start_unix_s: i64, stop_unix_s: i64, step_s: u32) -> usize {
     return resolution as usize;
 }
 
-impl ChartReqMetadata {
-    fn from_agg_chart_req(value: &AggChartRequest) -> Self {
-        Self {
-            start_unix_s: value.start_unix_s,
-            stop_unix_s: value.stop_unix_s,
-            step_s: value.step_s,
-            resolution: resolution(value.start_unix_s, value.stop_unix_s, value.step_s),
-        }
-    }
-    fn from_non_agg_chart_req(value: &NonAggChartRequest) -> Self {
+impl From<&ChartRequest> for ChartReqMetadata {
+    fn from(value: &ChartRequest) -> Self {
         Self {
             start_unix_s: value.start_unix_s,
             stop_unix_s: value.stop_unix_s,
@@ -354,9 +338,9 @@ impl Stream {
 }
 
 async fn get_chart_aggregated_batched(
-    req: Arc<AggChartRequest>,
-    meta: ChartReqMetadata,
+    req: Arc<ChartRequest>,
     agg: Aggregation,
+    meta: ChartReqMetadata,
     thread_idx: usize,
     num_threads: usize,
     time_partition: Arc<TimePartition>,
@@ -394,11 +378,11 @@ fn avg_final_agg(x: ValueTracker) -> f32 {
 
 async fn time_partition_get_agg_chart(
     time_partition: Arc<TimePartition>,
-    req: Arc<AggChartRequest>,
+    req: Arc<ChartRequest>,
     agg: Aggregation,
     num_threads: usize,
 ) -> Vec<Datapoint> {
-    let meta = ChartReqMetadata::from_agg_chart_req(&req);
+    let meta: ChartReqMetadata = req.as_ref().into();
 
     let threads_requested = req.stream_ids.len() / MIN_STREAMS_PER_THREAD;
     let threads_capped = min(threads_requested, num_threads);
@@ -407,8 +391,8 @@ async fn time_partition_get_agg_chart(
     let batches = (0..num_threads).map(|x| {
         get_chart_aggregated_batched(
             req.clone(),
-            meta,
             agg,
+            meta,
             x,
             num_threads,
             time_partition.clone(),
@@ -518,7 +502,7 @@ impl Storage {
         return partitions_in_range;
     }
 
-    pub async fn get_agg_chart(&self, req: AggChartRequest, agg: Aggregation) -> Vec<Datapoint> {
+    pub async fn get_agg_chart(&self, req: ChartRequest, agg: Aggregation) -> Vec<Datapoint> {
         let time_partitions = self
             .get_partitions_in_range(req.start_unix_s, req.stop_unix_s)
             .await;

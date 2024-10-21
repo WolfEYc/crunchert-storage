@@ -486,10 +486,14 @@ impl PartitionsFileHeader {
     }
 }
 
+#[derive(thiserror::Error, Debug)]
 pub enum StorageCreationError {
-    IOError(io::Error),
-    ConfigError(StorageConfigError),
-    DeserializationError(postcard::Error),
+    #[error("io error")]
+    IOError(#[from] io::Error),
+    #[error("config error")]
+    ConfigError(#[from] StorageConfigError),
+    #[error("postcard deserialization error")]
+    DeserializationError(#[from] postcard::Error),
 }
 
 impl Storage {

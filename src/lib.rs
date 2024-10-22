@@ -1,14 +1,14 @@
 use dashmap::DashMap;
 use itertools::Itertools;
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapMut};
 use pco::standalone::simple_decompress;
 use postcard::from_bytes;
-
 use std::cmp::{max, min};
 use std::sync::Arc;
 use std::{fmt::Debug, path::PathBuf};
 use std::{fs, io, usize};
 use tokio::task::JoinSet;
+use tracing::error;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,13 @@ use tokio::sync::{Mutex, RwLock};
 const PARTITIONS_FILE_HEADER_FILENAME: &str = "CruncheRTPartitionsConfig";
 const MIN_PTS_TO_COMPRESS: usize = 8192;
 const MIN_STREAMS_PER_THREAD: usize = 1024;
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ImportStream {
+    pub stream_id: u64,
+    pub timestamps: Vec<i64>,
+    pub values: Vec<f32>,
+}
 
 #[derive(Clone, Copy)]
 pub enum Aggregation {
@@ -50,28 +57,36 @@ pub struct StorageConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
-struct DiskStreamFileHeader {
+struct CompressedDiskStreamFileHeader {
     stream_id: u64,
     unix_s_byte_start: usize,
     unix_s_byte_stop: usize,
     values_byte_stop: usize,
-    compressed: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy)]
+enum DiskStreamFileHeader {
+    Compressed(CompressedDiskStreamFileHeader),
+    Uncompressed(u64),
 }
 
 #[derive(Serialize, Deserialize, Clone)]
 struct TimePartitionFileHeader {
     start_unix_s: i64,
-    file_path: PathBuf,
+    compressed_partition: PathBuf,
+    uncompressed_partition: PathBuf,
     disk_streams: Vec<DiskStreamFileHeader>,
 }
 
 impl TimePartitionFileHeader {
     fn new(config: &StorageConfig) -> Self {
-        let now = Utc::now().timestamp();
-        let file_path = config.data_storage_dir.join(now.to_string());
+        let start_unix_s = Utc::now().timestamp();
+        let compressed_partition = config.data_storage_dir.join(start_unix_s.to_string());
+        let uncompressed_partition = compressed_partition.join("_uncompressed");
         Self {
-            start_unix_s: now,
-            file_path,
+            start_unix_s,
+            compressed_partition,
+            uncompressed_partition,
             disk_streams: Default::default(),
         }
     }
@@ -89,15 +104,24 @@ struct HotStream {
     values: Vec<f32>,
 }
 
-struct Stream {
-    disk_header: DiskStreamFileHeader,
+struct CompressedStream {
+    disk_header: CompressedDiskStreamFileHeader,
     hot_stream: RwLock<Option<HotStream>>,
     last_accessed: Mutex<Option<i64>>,
+}
+struct UncompressedStream {
+    stream_id: u64,
+    hot_stream: RwLock<HotStream>,
+}
+
+enum Stream {
+    Compressed(CompressedStream),
+    Uncompressed(UncompressedStream),
 }
 
 struct TimePartition {
     start_unix_s: i64,
-    mmap: Mmap,
+    mmap: MmapMut,
     streams: DashMap<u64, Stream>,
 }
 
@@ -207,8 +231,8 @@ impl StorageConfig {
     }
 }
 
-impl DiskStreamFileHeader {
-    fn read_stream_from_mmap(&self, mmap: &Mmap) -> HotStream {
+impl CompressedDiskStreamFileHeader {
+    fn read_stream_from_compressed(&self, mmap: &MmapMut) -> HotStream {
         let unix_s_bytes = &mmap[self.unix_s_byte_start..self.unix_s_byte_stop];
         let value_bytes = &mmap[self.unix_s_byte_stop..self.values_byte_stop];
 
@@ -305,11 +329,11 @@ impl HotStream {
     }
 }
 
-impl Stream {
+impl CompressedStream {
     async fn get_chart_aggregated(
         &self,
         req: ChartReqMetadata,
-        mmap: &Mmap,
+        mmap: &MmapMut,
         aggregated_result: Vec<ValueTracker>,
         agg: Aggregation,
     ) -> Vec<ValueTracker> {
@@ -329,11 +353,45 @@ impl Stream {
             return x.add_stream_to_chart(req, aggregated_result, agg);
         }
 
-        let hot_stream = self.disk_header.read_stream_from_mmap(mmap);
+        let hot_stream = self.disk_header.read_stream_from_compressed(mmap);
 
         let res = hot_stream.add_stream_to_chart(req, aggregated_result, agg);
         *writable_hot_stream = Some(hot_stream);
         res
+    }
+}
+impl UncompressedStream {
+    async fn get_chart_aggregated(
+        &self,
+        req: ChartReqMetadata,
+        aggregated_result: Vec<ValueTracker>,
+        agg: Aggregation,
+    ) -> Vec<ValueTracker> {
+        let hot_stream = self.hot_stream.read().await;
+        return hot_stream.add_stream_to_chart(req, aggregated_result, agg);
+    }
+}
+
+impl Stream {
+    async fn get_chart_aggregated(
+        &self,
+        req: ChartReqMetadata,
+        mmap: &MmapMut,
+        aggregated_result: Vec<ValueTracker>,
+        agg: Aggregation,
+    ) -> Vec<ValueTracker> {
+        match self {
+            Stream::Compressed(compressed_stream) => {
+                compressed_stream
+                    .get_chart_aggregated(req, mmap, aggregated_result, agg)
+                    .await
+            }
+            Stream::Uncompressed(uncompressed_stream) => {
+                uncompressed_stream
+                    .get_chart_aggregated(req, aggregated_result, agg)
+                    .await
+            }
+        }
     }
 }
 
@@ -430,19 +488,26 @@ async fn time_partition_get_agg_chart(
 impl TryFrom<&TimePartitionFileHeader> for TimePartition {
     type Error = io::Error;
     fn try_from(value: &TimePartitionFileHeader) -> Result<Self, Self::Error> {
-        let hash_map_iter = value.disk_streams.iter().map(|x| {
-            (
-                x.stream_id,
-                Stream {
-                    disk_header: x.clone(),
+        let hash_map_iter = value.disk_streams.iter().map(|x| match x {
+            DiskStreamFileHeader::Compressed(compressed) => (
+                compressed.stream_id,
+                Stream::Compressed(CompressedStream {
+                    disk_header: compressed.clone(),
                     hot_stream: RwLock::new(None),
                     last_accessed: Mutex::new(None),
-                },
-            )
+                }),
+            ),
+            DiskStreamFileHeader::Uncompressed(stream_id) => (
+                *stream_id,
+                Stream::Uncompressed(UncompressedStream {
+                    stream_id: *stream_id,
+                    hot_stream: RwLock::new(HotStream::default()),
+                }),
+            ),
         });
 
-        let file = fs::File::open(&value.file_path)?;
-        let mmap = unsafe { Mmap::map(&file)? };
+        let file = fs::File::open(&value.compressed_partition)?;
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
         let streams = DashMap::from_iter(hash_map_iter);
         let start_unix_s = value.start_unix_s;
         Ok(Self {
@@ -478,6 +543,11 @@ pub enum StorageCreationError {
     ConfigError(#[from] StorageConfigError),
     #[error("postcard deserialization error")]
     DeserializationError(#[from] postcard::Error),
+}
+#[derive(thiserror::Error, Debug)]
+pub enum ImportStreamError {
+    #[error("io error")]
+    IOError(#[from] io::Error),
 }
 
 impl Storage {
@@ -544,6 +614,10 @@ impl Storage {
             partition_file_header,
             num_threads,
         })
+    }
+
+    pub fn import_stream(&self, import_stream: ImportStream) -> Result<Self, ImportStreamError> {
+        todo!()
     }
 }
 

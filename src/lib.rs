@@ -1,3 +1,4 @@
+use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
 use itertools::Itertools;
 use memmap2::{Mmap, MmapMut};
@@ -57,45 +58,31 @@ pub struct StorageConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
-struct CompressedDiskStreamFileHeader {
+struct ReadOnlyDiskStreamFileHeader {
     stream_id: u64,
     unix_s_byte_start: usize,
     unix_s_byte_stop: usize,
     values_byte_stop: usize,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
-enum DiskStreamFileHeader {
-    Compressed(CompressedDiskStreamFileHeader),
-    Uncompressed(u64),
+#[derive(Serialize, Deserialize, Clone)]
+struct ReadOnlyTimePartitionFileHeader {
+    start_unix_s: i64,
+    file_path: PathBuf,
+    disk_streams: Vec<ReadOnlyDiskStreamFileHeader>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct TimePartitionFileHeader {
+struct WritableTimePartitionFileHeader {
     start_unix_s: i64,
-    compressed_partition: PathBuf,
-    uncompressed_partition: PathBuf,
-    disk_streams: Vec<DiskStreamFileHeader>,
-}
-
-impl TimePartitionFileHeader {
-    fn new(config: &StorageConfig) -> Self {
-        let start_unix_s = Utc::now().timestamp();
-        let compressed_partition = config.data_storage_dir.join(start_unix_s.to_string());
-        let uncompressed_partition = compressed_partition.join("_uncompressed");
-        Self {
-            start_unix_s,
-            compressed_partition,
-            uncompressed_partition,
-            disk_streams: Default::default(),
-        }
-    }
+    file_path: PathBuf,
 }
 
 #[derive(Serialize, Deserialize)]
 struct PartitionsFileHeader {
     // sorted descending start_unix_s
-    time_partitions: Vec<TimePartitionFileHeader>,
+    read_only_time_partitions: Vec<ReadOnlyTimePartitionFileHeader>,
+    writable_time_partitions: Vec<WritableTimePartitionFileHeader>,
 }
 
 #[derive(Default)]
@@ -104,31 +91,27 @@ struct HotStream {
     values: Vec<f32>,
 }
 
-struct CompressedStream {
-    disk_header: CompressedDiskStreamFileHeader,
+struct ReadOnlyStream {
+    disk_header: ReadOnlyDiskStreamFileHeader,
     hot_stream: RwLock<Option<HotStream>>,
     last_accessed: Mutex<Option<i64>>,
 }
-struct UncompressedStream {
-    stream_id: u64,
-    hot_stream: RwLock<HotStream>,
-}
 
-enum Stream {
-    Compressed(CompressedStream),
-    Uncompressed(UncompressedStream),
+struct ReadOnlyTimePartition {
+    start_unix_s: i64,
+    mmap: Mmap,
+    streams: DashMap<u64, ReadOnlyStream>,
 }
-
-struct TimePartition {
+struct WritableTimePartition {
     start_unix_s: i64,
     mmap: MmapMut,
-    streams: DashMap<u64, Stream>,
+    streams: DashMap<u64, RwLock<HotStream>>,
 }
 
 pub struct Storage {
     config: StorageConfig,
-    partitions: RwLock<Vec<Arc<TimePartition>>>,
-    partition_file_header: PartitionsFileHeader,
+    readonly_partitions: RwLock<Vec<Arc<ReadOnlyTimePartition>>>,
+    writable_partitions: RwLock<Vec<Arc<WritableTimePartition>>>,
     num_threads: usize,
 }
 
@@ -138,6 +121,17 @@ struct ChartReqMetadata {
     stop_unix_s: i64,
     step_s: u32,
     resolution: usize,
+}
+
+impl WritableTimePartitionFileHeader {
+    fn new(config: &StorageConfig) -> Self {
+        let start_unix_s = Utc::now().timestamp();
+        let file_path = config.data_storage_dir.join(start_unix_s.to_string());
+        Self {
+            start_unix_s,
+            file_path,
+        }
+    }
 }
 
 #[inline]
@@ -231,8 +225,8 @@ impl StorageConfig {
     }
 }
 
-impl CompressedDiskStreamFileHeader {
-    fn read_stream_from_compressed(&self, mmap: &MmapMut) -> HotStream {
+impl ReadOnlyDiskStreamFileHeader {
+    fn read_stream_from_compressed(&self, mmap: &Mmap) -> HotStream {
         let unix_s_bytes = &mmap[self.unix_s_byte_start..self.unix_s_byte_stop];
         let value_bytes = &mmap[self.unix_s_byte_stop..self.values_byte_stop];
 
@@ -329,11 +323,11 @@ impl HotStream {
     }
 }
 
-impl CompressedStream {
+impl ReadOnlyStream {
     async fn get_chart_aggregated(
         &self,
         req: ChartReqMetadata,
-        mmap: &MmapMut,
+        mmap: &Mmap,
         aggregated_result: Vec<ValueTracker>,
         agg: Aggregation,
     ) -> Vec<ValueTracker> {
@@ -360,48 +354,14 @@ impl CompressedStream {
         res
     }
 }
-impl UncompressedStream {
-    async fn get_chart_aggregated(
-        &self,
-        req: ChartReqMetadata,
-        aggregated_result: Vec<ValueTracker>,
-        agg: Aggregation,
-    ) -> Vec<ValueTracker> {
-        let hot_stream = self.hot_stream.read().await;
-        return hot_stream.add_stream_to_chart(req, aggregated_result, agg);
-    }
-}
 
-impl Stream {
-    async fn get_chart_aggregated(
-        &self,
-        req: ChartReqMetadata,
-        mmap: &MmapMut,
-        aggregated_result: Vec<ValueTracker>,
-        agg: Aggregation,
-    ) -> Vec<ValueTracker> {
-        match self {
-            Stream::Compressed(compressed_stream) => {
-                compressed_stream
-                    .get_chart_aggregated(req, mmap, aggregated_result, agg)
-                    .await
-            }
-            Stream::Uncompressed(uncompressed_stream) => {
-                uncompressed_stream
-                    .get_chart_aggregated(req, aggregated_result, agg)
-                    .await
-            }
-        }
-    }
-}
-
-async fn get_chart_aggregated_batched(
+async fn read_only_get_chart_aggregated_batched(
     req: Arc<ChartRequest>,
     agg: Aggregation,
     meta: ChartReqMetadata,
     thread_idx: usize,
     num_threads: usize,
-    time_partition: Arc<TimePartition>,
+    time_partition: Arc<ReadOnlyTimePartition>,
 ) -> Vec<ValueTracker> {
     let streams_per_thread = req.stream_ids.len() / num_threads;
     let start_idx = streams_per_thread * thread_idx;
@@ -425,6 +385,51 @@ async fn get_chart_aggregated_batched(
     return aggregated_batch;
 }
 
+impl WritableTimePartition {
+    fn get_stream_from_wal(&self, stream_id: u64, meta: ChartReqMetadata) -> Option<HotStream> {
+        todo!()
+    }
+}
+
+async fn writable_get_chart_aggregated_batched(
+    req: Arc<ChartRequest>,
+    agg: Aggregation,
+    meta: ChartReqMetadata,
+    thread_idx: usize,
+    num_threads: usize,
+    time_partition: Arc<WritableTimePartition>,
+) -> Vec<ValueTracker> {
+    let streams_per_thread = req.stream_ids.len() / num_threads;
+    let start_idx = streams_per_thread * thread_idx;
+    let stop_idx = if thread_idx == num_threads - 1 {
+        req.stream_ids.len()
+    } else {
+        streams_per_thread * (thread_idx + 1)
+    };
+    // pretty confident with this math, if it goes wrong, then well shit
+
+    let streams = req.stream_ids[start_idx..stop_idx].iter().filter_map(|x| {
+        let from_cache = time_partition.streams.get(x);
+        if from_cache.is_some() {
+            return from_cache;
+        }
+        let Some(stream_from_wal) = time_partition.get_stream_from_wal(*x, meta) else {
+            return None;
+        };
+
+        let locked_stream = RwLock::new(stream_from_wal);
+        time_partition.streams.insert(*x, locked_stream);
+        time_partition.streams.get(x)
+    });
+
+    let mut aggregated_batch = vec![ValueTracker::default(); meta.resolution];
+    for stream in streams {
+        let readable_stream = stream.read().await;
+        aggregated_batch = readable_stream.add_stream_to_chart(meta, aggregated_batch, agg);
+    }
+    return aggregated_batch;
+}
+
 #[inline]
 fn default_final_agg_fn(x: ValueTracker) -> f32 {
     x.value
@@ -434,8 +439,8 @@ fn avg_final_agg(x: ValueTracker) -> f32 {
     x.value / x.count as f32
 }
 
-async fn time_partition_get_agg_chart(
-    time_partition: Arc<TimePartition>,
+async fn read_only_time_partition_get_agg_chart(
+    time_partition: Arc<ReadOnlyTimePartition>,
     req: Arc<ChartRequest>,
     agg: Aggregation,
     num_threads: usize,
@@ -447,7 +452,7 @@ async fn time_partition_get_agg_chart(
     let num_threads = max(threads_capped, 1);
 
     let batches = (0..num_threads).map(|x| {
-        get_chart_aggregated_batched(
+        read_only_get_chart_aggregated_batched(
             req.clone(),
             agg,
             meta,
@@ -485,31 +490,92 @@ async fn time_partition_get_agg_chart(
         .collect()
 }
 
-impl TryFrom<&TimePartitionFileHeader> for TimePartition {
+async fn writable_time_partition_get_agg_chart(
+    time_partition: Arc<WritableTimePartition>,
+    req: Arc<ChartRequest>,
+    agg: Aggregation,
+    num_threads: usize,
+) -> Vec<Datapoint> {
+    let meta: ChartReqMetadata = req.as_ref().into();
+
+    let threads_requested = req.stream_ids.len() / MIN_STREAMS_PER_THREAD;
+    let threads_capped = min(threads_requested, num_threads);
+    let num_threads = max(threads_capped, 1);
+
+    let batches = (0..num_threads).map(|x| {
+        writable_get_chart_aggregated_batched(
+            req.clone(),
+            agg,
+            meta,
+            x,
+            num_threads,
+            time_partition.clone(),
+        )
+    });
+    let agg_fn = agg_to_agg_fn(agg);
+    let batched_agg_chart = JoinSet::from_iter(batches).join_all().await;
+    let reduced = batched_agg_chart.into_iter().reduce(|acc, x| {
+        acc.into_iter()
+            .zip(x)
+            .map(|(x, y)| x.agg(y, &agg_fn))
+            .collect()
+    });
+
+    let Some(reduced) = reduced else {
+        panic!("tried to aggregate nothing");
+    };
+
+    let final_agg = match agg {
+        Aggregation::Avg => avg_final_agg,
+        _ => default_final_agg_fn,
+    };
+
+    reduced
+        .into_iter()
+        .zip(iter_search_ts(meta))
+        .filter(|(x, _)| x.count > 0)
+        .map(|(x, ts)| Datapoint {
+            unix_s: ts,
+            value: final_agg(x),
+        })
+        .collect()
+}
+
+impl TryFrom<ReadOnlyTimePartitionFileHeader> for ReadOnlyTimePartition {
     type Error = io::Error;
-    fn try_from(value: &TimePartitionFileHeader) -> Result<Self, Self::Error> {
-        let hash_map_iter = value.disk_streams.iter().map(|x| match x {
-            DiskStreamFileHeader::Compressed(compressed) => (
-                compressed.stream_id,
-                Stream::Compressed(CompressedStream {
-                    disk_header: compressed.clone(),
+    fn try_from(value: ReadOnlyTimePartitionFileHeader) -> Result<Self, Self::Error> {
+        let hash_map_iter = value.disk_streams.into_iter().map(|x| {
+            (
+                x.stream_id,
+                ReadOnlyStream {
+                    disk_header: x,
                     hot_stream: RwLock::new(None),
                     last_accessed: Mutex::new(None),
-                }),
-            ),
-            DiskStreamFileHeader::Uncompressed(stream_id) => (
-                *stream_id,
-                Stream::Uncompressed(UncompressedStream {
-                    stream_id: *stream_id,
-                    hot_stream: RwLock::new(HotStream::default()),
-                }),
-            ),
+                },
+            )
         });
 
-        let file = fs::File::open(&value.compressed_partition)?;
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
+        let file = fs::File::open(&value.file_path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
         let streams = DashMap::from_iter(hash_map_iter);
         let start_unix_s = value.start_unix_s;
+        Ok(Self {
+            start_unix_s,
+            streams,
+            mmap,
+        })
+    }
+}
+
+impl TryFrom<WritableTimePartitionFileHeader> for WritableTimePartition {
+    type Error = io::Error;
+    fn try_from(value: WritableTimePartitionFileHeader) -> Result<Self, Self::Error> {
+        let file = fs::File::open(&value.file_path)?;
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
+
+        let start_unix_s = value.start_unix_s;
+        let streams = DashMap::new();
+
         Ok(Self {
             start_unix_s,
             streams,
@@ -521,17 +587,32 @@ impl TryFrom<&TimePartitionFileHeader> for TimePartition {
 impl PartitionsFileHeader {
     fn new(config: &StorageConfig) -> Self {
         Self {
-            time_partitions: vec![TimePartitionFileHeader::new(config)],
+            read_only_time_partitions: Vec::new(),
+            writable_time_partitions: vec![WritableTimePartitionFileHeader::new(config)],
         }
     }
-    fn thaw(&self, config: &StorageConfig) -> Result<Vec<Arc<TimePartition>>, io::Error> {
-        let now = Utc::now().timestamp();
-        let cutoff = now - config.cold_storage_after_s as i64;
-        self.time_partitions
-            .iter()
-            .filter(|x| x.start_unix_s > cutoff)
-            .map(|x| x.try_into())
-            .process_results(|iter| iter.map(Arc::new).collect())
+    fn thaw(
+        self,
+    ) -> Result<
+        (
+            Vec<Arc<ReadOnlyTimePartition>>,
+            Vec<Arc<WritableTimePartition>>,
+        ),
+        io::Error,
+    > {
+        let readonly_partitions = self
+            .read_only_time_partitions
+            .into_iter()
+            .map(ReadOnlyTimePartition::try_from)
+            .process_results(|iter| iter.map(Arc::new).collect())?;
+
+        let writable_partitions = self
+            .writable_time_partitions
+            .into_iter()
+            .map(WritableTimePartition::try_from)
+            .process_results(|iter| iter.map(Arc::new).collect())?;
+
+        Ok((readonly_partitions, writable_partitions))
     }
 }
 
@@ -551,14 +632,35 @@ pub enum ImportStreamError {
 }
 
 impl Storage {
-    async fn get_partitions_in_range(
+    async fn get_read_only_partitions_in_range(
         &self,
         start_unix_s: i64,
         stop_unix_s: i64,
-    ) -> Vec<Arc<TimePartition>> {
+    ) -> Vec<Arc<ReadOnlyTimePartition>> {
         let mut partition_end = Utc::now().timestamp();
         let mut partitions_in_range = Vec::new();
-        let partitions = self.partitions.read().await;
+        let partitions = self.readonly_partitions.read().await;
+        for partition in partitions.iter() {
+            if start_unix_s > partition_end {
+                return partitions_in_range;
+            }
+            partition_end = partition.start_unix_s;
+            if stop_unix_s < partition.start_unix_s {
+                continue;
+            }
+            partitions_in_range.push(partition.clone());
+        }
+        return partitions_in_range;
+    }
+
+    async fn get_writable_partitions_in_range(
+        &self,
+        start_unix_s: i64,
+        stop_unix_s: i64,
+    ) -> Vec<Arc<WritableTimePartition>> {
+        let mut partition_end = Utc::now().timestamp();
+        let mut partitions_in_range = Vec::new();
+        let partitions = self.writable_partitions.read().await;
         for partition in partitions.iter() {
             if start_unix_s > partition_end {
                 return partitions_in_range;
@@ -573,15 +675,32 @@ impl Storage {
     }
 
     pub async fn get_agg_chart(&self, req: ChartRequest, agg: Aggregation) -> Vec<Datapoint> {
-        let time_partitions = self
-            .get_partitions_in_range(req.start_unix_s, req.stop_unix_s)
+        let read_only_time_partitions = self
+            .get_read_only_partitions_in_range(req.start_unix_s, req.stop_unix_s)
+            .await;
+        let writable_time_partitions = self
+            .get_writable_partitions_in_range(req.start_unix_s, req.stop_unix_s)
             .await;
         let arc_req = Arc::new(req);
-        let datapoint_jobs = time_partitions
+        let read_only_datapoint_jobs = read_only_time_partitions.into_iter().map(|x| {
+            read_only_time_partition_get_agg_chart(x, arc_req.clone(), agg, self.num_threads)
+        });
+        let writable_datapoint_jobs = writable_time_partitions.into_iter().map(|x| {
+            writable_time_partition_get_agg_chart(x, arc_req.clone(), agg, self.num_threads)
+        });
+
+        let read_only_datapoints_nested = JoinSet::from_iter(read_only_datapoint_jobs).join_all();
+        let writeable_datapoints_nested = JoinSet::from_iter(writable_datapoint_jobs).join_all();
+        let all_datapoints_nested =
+            JoinSet::from_iter([writeable_datapoints_nested, read_only_datapoints_nested])
+                .join_all()
+                .await;
+
+        let datapoints_flattened = all_datapoints_nested
             .into_iter()
-            .map(|x| time_partition_get_agg_chart(x, arc_req.clone(), agg, self.num_threads));
-        let datapoints_nested = JoinSet::from_iter(datapoint_jobs).join_all().await;
-        let datapoints_flattened = datapoints_nested.into_iter().flatten().collect();
+            .flatten()
+            .flatten()
+            .collect();
         return datapoints_flattened;
     }
 
@@ -594,7 +713,7 @@ impl Storage {
             .data_storage_dir
             .join(PARTITIONS_FILE_HEADER_FILENAME);
 
-        let partition_file_header: PartitionsFileHeader = if partitions_file_path.exists() {
+        let partitions_file_header: PartitionsFileHeader = if partitions_file_path.exists() {
             let partitions_file_header_bytes =
                 std::fs::read(partitions_file_path).map_err(StorageCreationError::IOError)?;
             from_bytes(&partitions_file_header_bytes)
@@ -603,15 +722,16 @@ impl Storage {
             PartitionsFileHeader::new(&config)
         };
 
-        let partitions = partition_file_header
-            .thaw(&config)
+        let (readonly_partitions, writeable_partitions) = partitions_file_header
+            .thaw()
             .map_err(StorageCreationError::IOError)?;
-        let partitions = RwLock::new(partitions);
+        let readonly_partitions = RwLock::new(readonly_partitions);
+        let writable_partitions = RwLock::new(writeable_partitions);
 
         Ok(Self {
             config,
-            partitions,
-            partition_file_header,
+            readonly_partitions,
+            writable_partitions,
             num_threads,
         })
     }

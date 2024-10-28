@@ -1,10 +1,10 @@
-use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
 use itertools::Itertools;
 use memmap2::{Mmap, MmapMut};
 use pco::standalone::simple_decompress;
 use postcard::from_bytes;
 use std::cmp::{max, min};
+use std::fs::OpenOptions;
 use std::sync::Arc;
 use std::{fmt::Debug, path::PathBuf};
 use std::{fs, io, usize};
@@ -16,13 +16,20 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
 const PARTITIONS_FILE_HEADER_FILENAME: &str = "CruncheRTPartitionsConfig";
-const MIN_PTS_TO_COMPRESS: usize = 8192;
 const MIN_STREAMS_PER_THREAD: usize = 1024;
+const MIN_COMPRESSION_LEVEL: usize = 4;
+const MAX_COMPRESSION_LEVEL: usize = 12;
+const MIN_RETENTION_PERIOD_S: usize = 900; //15m
+const MAX_RETENTION_PERIOD_S: usize = 3156000000; //100y
+const MIN_WRITEABLE_PARTITIONS: usize = 2;
+const MAX_DATA_FREQUENCY_S: usize = 86400;
+const MIN_PARTITION_DURATION_S: usize = 3600;
+const MAX_PARTITION_DURATION_S: usize = 31536000; //1y
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ImportStream {
-    pub stream_id: u64,
     pub timestamps: Vec<i64>,
+    pub stream_ids: Vec<u64>,
     pub values: Vec<f32>,
 }
 
@@ -49,12 +56,13 @@ pub struct Datapoint {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct StorageConfig {
+    pub data_storage_dir: PathBuf,
     pub compression_level: usize,
     pub retention_period_s: usize,
-    pub cold_storage_after_s: usize,
-    pub data_frequency_s: usize,
     pub stream_cache_ttl_s: usize,
-    pub data_storage_dir: PathBuf,
+    pub data_frequency_s: usize,
+    pub partition_duration_s: usize,
+    pub writable_partitions: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
@@ -75,7 +83,9 @@ struct ReadOnlyTimePartitionFileHeader {
 #[derive(Serialize, Deserialize, Clone)]
 struct WritableTimePartitionFileHeader {
     start_unix_s: i64,
-    file_path: PathBuf,
+    timestamps_file_path: PathBuf,
+    stream_ids_file_path: PathBuf,
+    values_file_path: PathBuf,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -104,12 +114,15 @@ struct ReadOnlyTimePartition {
 }
 struct WritableTimePartition {
     start_unix_s: i64,
-    mmap: MmapMut,
+    timestamps_wal: MmapMut,
+    stream_ids_wal: MmapMut,
+    values_wal: MmapMut,
     streams: DashMap<u64, RwLock<HotStream>>,
 }
 
 pub struct Storage {
     config: StorageConfig,
+    partitions_file_header: PartitionsFileHeader,
     readonly_partitions: RwLock<Vec<Arc<ReadOnlyTimePartition>>>,
     writable_partitions: RwLock<Vec<Arc<WritableTimePartition>>>,
     num_threads: usize,
@@ -123,13 +136,56 @@ struct ChartReqMetadata {
     resolution: usize,
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum StorageCreationError {
+    #[error("io error")]
+    IOError(#[from] io::Error),
+    #[error("config error")]
+    ConfigError(#[from] StorageConfigError),
+    #[error("postcard deserialization error")]
+    DeserializationError(#[from] postcard::Error),
+}
+#[derive(thiserror::Error, Debug)]
+pub enum ImportStreamError {
+    #[error("io error")]
+    IOError(#[from] io::Error),
+    #[error("input columns length does not match")]
+    ColumnLengthMismatch,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum StorageConfigError {
+    #[error("COMPRESSION_LEVEL must be >= {MIN_COMPRESSION_LEVEL}")]
+    ToLowCompressionLevel,
+    #[error("COMPRESSION_LEVEL must be <= {MAX_COMPRESSION_LEVEL}")]
+    ToHighCompressionLevel,
+    #[error("RETENTION_PERIOD_S must be >= {MIN_RETENTION_PERIOD_S}")]
+    ToLowRetentionPeriod,
+    #[error("RETENTION_PERIOD_S must be <= {MAX_RETENTION_PERIOD_S}")]
+    ToHighRetentionPeriod,
+    #[error("WRITEABLE_PARTITIONS must be >= {MIN_WRITEABLE_PARTITIONS}")]
+    ToLowWritablePartitions,
+    #[error("PARTITION_DURATION_S must be >= {MIN_PARTITION_DURATION_S}")]
+    ToLowPartitionDuration,
+    #[error("PARTITION_DURATION_S must be <= {MAX_PARTITION_DURATION_S}")]
+    ToHighPartitionDuration,
+    #[error("DATA_FREQUENCY_S must be <= {MAX_DATA_FREQUENCY_S}")]
+    ToHighDataFrequency,
+
+}
+
 impl WritableTimePartitionFileHeader {
     fn new(config: &StorageConfig) -> Self {
         let start_unix_s = Utc::now().timestamp();
         let file_path = config.data_storage_dir.join(start_unix_s.to_string());
+        let timestamps_file_path = file_path.join("timestamps");
+        let stream_ids_file_path = file_path.join("stream_ids");
+        let values_file_path = file_path.join("values");
         Self {
             start_unix_s,
-            file_path,
+            timestamps_file_path,
+            stream_ids_file_path,
+            values_file_path,
         }
     }
 }
@@ -156,38 +212,14 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             compression_level: 8,
-            retention_period_s: 31104000,  //1y
-            cold_storage_after_s: 7776000, //90d
-            data_frequency_s: 900,
-            stream_cache_ttl_s: 900,
+            retention_period_s: 31536000, //1y
+            partition_duration_s: 86400,  //1d
+            stream_cache_ttl_s: 900, //15m
+            writable_partitions: 2,
+            data_frequency_s: 900, //15m
             data_storage_dir: PathBuf::from("/var/lib/wolfeymetrics"),
         }
     }
-}
-
-const MIN_COMPRESSION_LEVEL: usize = 4;
-const MAX_COMPRESSION_LEVEL: usize = 12;
-const MIN_RETENTION_PERIOD_S: usize = 900; //15m
-const MIN_COLD_STORAGE_S: usize = 7776000; //90d
-const MAX_RETENTION_PERIOD_S: usize = 3156000000; //100y
-const MAX_DATA_FREQUENCY_S: usize = 604800; //7d
-
-#[derive(thiserror::Error, Debug)]
-pub enum StorageConfigError {
-    #[error("COMPRESSION_LEVEL must be >= {MIN_COMPRESSION_LEVEL}")]
-    ToLowCompressionLevel,
-    #[error("COMPRESSION_LEVEL must be <= {MAX_COMPRESSION_LEVEL}")]
-    ToHighCompressionLevel,
-    #[error("RETENTION_PERIOD must be >= {MIN_RETENTION_PERIOD_S}")]
-    ToLowRetentionPeriod,
-    #[error("RETENTION_PERIOD must be <= {MAX_RETENTION_PERIOD_S}")]
-    ToHighRetentionPeriod,
-    #[error("RETENTION_PERIOD_S must be >= COLD_STORAGE_AFTER_S")]
-    ColdStorageCannotBeGreaterThanRetention,
-    #[error("COLD_STORAGE_AFTER_S must be >= {MIN_COLD_STORAGE_S} or RETENTION_PERIOD_S")]
-    ColdStorageTooLow,
-    #[error("DATA_FREQUENCY_S must be <= {MAX_DATA_FREQUENCY_S}")]
-    DataFrequencyTooHigh,
 }
 
 impl StorageConfig {
@@ -207,19 +239,20 @@ impl StorageConfig {
             return Err(StorageConfigError::ToHighRetentionPeriod);
         }
 
-        if self.retention_period_s < self.cold_storage_after_s {
-            return Err(StorageConfigError::ColdStorageCannotBeGreaterThanRetention);
+        if self.writable_partitions < MIN_WRITEABLE_PARTITIONS {
+            return Err(StorageConfigError::ToLowWritablePartitions);
         }
 
-        let min_cold_storage_s = std::cmp::min(MIN_COLD_STORAGE_S, self.retention_period_s);
-
-        if self.cold_storage_after_s < min_cold_storage_s {
-            return Err(StorageConfigError::ColdStorageTooLow);
+        if self.partition_duration_s < MIN_PARTITION_DURATION_S {
+            return Err(StorageConfigError::ToLowPartitionDuration);
         }
-
+        if self.partition_duration_s > MAX_PARTITION_DURATION_S {
+            return Err(StorageConfigError::ToHighPartitionDuration);
+        }
         if self.data_frequency_s > MAX_DATA_FREQUENCY_S {
-            return Err(StorageConfigError::DataFrequencyTooHigh);
+            return Err(StorageConfigError::ToHighDataFrequency);
         }
+
 
         Ok(self)
     }
@@ -386,9 +419,13 @@ async fn read_only_get_chart_aggregated_batched(
 }
 
 impl WritableTimePartition {
+    async fn import_stream(&self, stream: ImportStream) -> Result<(), ImportStreamError> {
+        todo!()
+    }
     fn get_stream_from_wal(&self, stream_id: u64, meta: ChartReqMetadata) -> Option<HotStream> {
         todo!()
     }
+    
 }
 
 async fn writable_get_chart_aggregated_batched(
@@ -541,10 +578,10 @@ async fn writable_time_partition_get_agg_chart(
         .collect()
 }
 
-impl TryFrom<ReadOnlyTimePartitionFileHeader> for ReadOnlyTimePartition {
+impl TryFrom<&ReadOnlyTimePartitionFileHeader> for ReadOnlyTimePartition {
     type Error = io::Error;
-    fn try_from(value: ReadOnlyTimePartitionFileHeader) -> Result<Self, Self::Error> {
-        let hash_map_iter = value.disk_streams.into_iter().map(|x| {
+    fn try_from(value: &ReadOnlyTimePartitionFileHeader) -> Result<Self, Self::Error> {
+        let hash_map_iter = value.disk_streams.iter().cloned().map(|x| {
             (
                 x.stream_id,
                 ReadOnlyStream {
@@ -567,11 +604,30 @@ impl TryFrom<ReadOnlyTimePartitionFileHeader> for ReadOnlyTimePartition {
     }
 }
 
-impl TryFrom<WritableTimePartitionFileHeader> for WritableTimePartition {
+impl TryFrom<&WritableTimePartitionFileHeader> for WritableTimePartition {
     type Error = io::Error;
-    fn try_from(value: WritableTimePartitionFileHeader) -> Result<Self, Self::Error> {
-        let file = fs::File::open(&value.file_path)?;
-        let mmap = unsafe { MmapMut::map_mut(&file)? };
+    fn try_from(value: &WritableTimePartitionFileHeader) -> Result<Self, Self::Error> {
+        let timestamps_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&value.timestamps_file_path)?;
+        let timestamps_wal = unsafe { MmapMut::map_mut(&timestamps_file)? };
+
+        let stream_ids_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&value.stream_ids_file_path)?;
+
+        let stream_ids_wal = unsafe { MmapMut::map_mut(&stream_ids_file)? };
+
+        let values_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&value.timestamps_file_path)?;
+        let values_wal = unsafe { MmapMut::map_mut(&values_file)? };
 
         let start_unix_s = value.start_unix_s;
         let streams = DashMap::new();
@@ -579,7 +635,9 @@ impl TryFrom<WritableTimePartitionFileHeader> for WritableTimePartition {
         Ok(Self {
             start_unix_s,
             streams,
-            mmap,
+            timestamps_wal,
+            stream_ids_wal,
+            values_wal,
         })
     }
 }
@@ -592,7 +650,7 @@ impl PartitionsFileHeader {
         }
     }
     fn thaw(
-        self,
+        &self,
     ) -> Result<
         (
             Vec<Arc<ReadOnlyTimePartition>>,
@@ -602,33 +660,18 @@ impl PartitionsFileHeader {
     > {
         let readonly_partitions = self
             .read_only_time_partitions
-            .into_iter()
+            .iter()
             .map(ReadOnlyTimePartition::try_from)
             .process_results(|iter| iter.map(Arc::new).collect())?;
 
         let writable_partitions = self
             .writable_time_partitions
-            .into_iter()
+            .iter()
             .map(WritableTimePartition::try_from)
             .process_results(|iter| iter.map(Arc::new).collect())?;
 
         Ok((readonly_partitions, writable_partitions))
     }
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum StorageCreationError {
-    #[error("io error")]
-    IOError(#[from] io::Error),
-    #[error("config error")]
-    ConfigError(#[from] StorageConfigError),
-    #[error("postcard deserialization error")]
-    DeserializationError(#[from] postcard::Error),
-}
-#[derive(thiserror::Error, Debug)]
-pub enum ImportStreamError {
-    #[error("io error")]
-    IOError(#[from] io::Error),
 }
 
 impl Storage {
@@ -730,13 +773,20 @@ impl Storage {
 
         Ok(Self {
             config,
+            partitions_file_header,
             readonly_partitions,
             writable_partitions,
             num_threads,
         })
     }
 
-    pub fn import_stream(&self, import_stream: ImportStream) -> Result<Self, ImportStreamError> {
+    pub fn import_stream(&self, stream: ImportStream) -> Result<Self, ImportStreamError> {
+        if stream.stream_ids.len() != stream.timestamps.len()
+            || stream.stream_ids.len() != stream.values.len()
+        {
+            return Err(ImportStreamError::ColumnLengthMismatch);
+        }
+        
         todo!()
     }
 }

@@ -1,10 +1,11 @@
 use dashmap::DashMap;
 use itertools::Itertools;
-use memmap2::{Mmap, MmapMut};
+use memmap2::{Mmap, MmapMut, RemapOptions};
 use pco::standalone::simple_decompress;
 use postcard::from_bytes;
 use std::cmp::{max, min};
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
+use std::path::Path;
 use std::sync::Arc;
 use std::{fmt::Debug, path::PathBuf};
 use std::{fs, io, usize};
@@ -26,11 +27,14 @@ const MAX_DATA_FREQUENCY_S: usize = 86400;
 const MIN_PARTITION_DURATION_S: usize = 3600;
 const MAX_PARTITION_DURATION_S: usize = 31536000; //1y
 
-#[derive(Serialize, Deserialize, Clone)]
+pub struct StreamPoint {
+    pub timestamp: i64,
+    pub stream_id: u64,
+    pub value: f32,
+}
+
 pub struct ImportStream {
-    pub timestamps: Vec<i64>,
-    pub stream_ids: Vec<u64>,
-    pub values: Vec<f32>,
+    pub pts: Vec<StreamPoint>,
 }
 
 #[derive(Clone, Copy)]
@@ -83,6 +87,7 @@ struct ReadOnlyTimePartitionFileHeader {
 #[derive(Serialize, Deserialize, Clone)]
 struct WritableTimePartitionFileHeader {
     start_unix_s: i64,
+    len: usize,
     timestamps_file_path: PathBuf,
     stream_ids_file_path: PathBuf,
     values_file_path: PathBuf,
@@ -112,11 +117,18 @@ struct ReadOnlyTimePartition {
     mmap: Mmap,
     streams: DashMap<u64, ReadOnlyStream>,
 }
+
+struct ResizableMmapMut {
+    mmap: MmapMut,
+    file: File,
+}
+
 struct WritableTimePartition {
+    len: usize,
     start_unix_s: i64,
-    timestamps_wal: MmapMut,
-    stream_ids_wal: MmapMut,
-    values_wal: MmapMut,
+    timestamps_mmap: ResizableMmapMut,
+    streams_mmap: ResizableMmapMut,
+    values_mmap: ResizableMmapMut,
     streams: DashMap<u64, RwLock<HotStream>>,
 }
 
@@ -149,8 +161,8 @@ pub enum StorageCreationError {
 pub enum ImportStreamError {
     #[error("io error")]
     IOError(#[from] io::Error),
-    #[error("input columns length does not match")]
-    ColumnLengthMismatch,
+    #[error("input must be non empty")]
+    EmptyInputError,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -171,7 +183,6 @@ pub enum StorageConfigError {
     ToHighPartitionDuration,
     #[error("DATA_FREQUENCY_S must be <= {MAX_DATA_FREQUENCY_S}")]
     ToHighDataFrequency,
-
 }
 
 impl WritableTimePartitionFileHeader {
@@ -182,6 +193,7 @@ impl WritableTimePartitionFileHeader {
         let stream_ids_file_path = file_path.join("stream_ids");
         let values_file_path = file_path.join("values");
         Self {
+            len: 0,
             start_unix_s,
             timestamps_file_path,
             stream_ids_file_path,
@@ -214,7 +226,7 @@ impl Default for StorageConfig {
             compression_level: 8,
             retention_period_s: 31536000, //1y
             partition_duration_s: 86400,  //1d
-            stream_cache_ttl_s: 900, //15m
+            stream_cache_ttl_s: 900,      //15m
             writable_partitions: 2,
             data_frequency_s: 900, //15m
             data_storage_dir: PathBuf::from("/var/lib/wolfeymetrics"),
@@ -252,7 +264,6 @@ impl StorageConfig {
         if self.data_frequency_s > MAX_DATA_FREQUENCY_S {
             return Err(StorageConfigError::ToHighDataFrequency);
         }
-
 
         Ok(self)
     }
@@ -418,14 +429,84 @@ async fn read_only_get_chart_aggregated_batched(
     return aggregated_batch;
 }
 
+impl ResizableMmapMut {
+    fn new(path: &Path) -> Result<Self, io::Error> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
+        let mmap = unsafe { MmapMut::map_mut(&file)? };
+
+        Ok(Self { mmap, file })
+    }
+    fn remap(&mut self, new_len: usize, opts: RemapOptions) -> Result<(), io::Error> {
+        if new_len < self.mmap.len() {
+            return Ok(());
+        }
+
+        let new_capacity = self.mmap.len() * 2;
+        self.file.set_len(new_capacity as u64)?;
+        unsafe {
+            self.mmap.remap(new_capacity, opts)?;
+        }
+        Ok(())
+    }
+
+    fn align_to<T>(&self, len: usize) -> &[T] {
+        unsafe {
+            let (_, res, _) = self.mmap[0..len].align_to();
+            res
+        }
+    }
+}
+
 impl WritableTimePartition {
-    async fn import_stream(&self, stream: ImportStream) -> Result<(), ImportStreamError> {
+    fn remap(&mut self, new_len: usize) -> Result<(), io::Error> {
+        let remap_opts = RemapOptions::new().may_move(true);
+
+        self.timestamps_mmap.remap(new_len, remap_opts)?;
+        self.streams_mmap.remap(new_len, remap_opts)?;
+        self.values_mmap.remap(new_len, remap_opts)?;
+
+        self.len = new_len;
+        Ok(())
+    }
+
+    fn timestamps(&self) -> &[i64] {
+        self.timestamps_mmap.align_to(self.len)
+    }
+
+    async fn import_stream(&self, mut stream: ImportStream) -> Result<(), ImportStreamError> {
+        if stream.pts.is_empty() {
+            return Err(ImportStreamError::EmptyInputError);
+        }
+
+        let new_mmap_size = self.len + stream.pts.len();
+
+        stream.pts.sort_unstable_by_key(|x| x.timestamp);
+
+        let start_ts = stream.pts.first().unwrap().timestamp;
+        let end_ts = stream.pts.last().unwrap().timestamp;
+
+        let wal_timestamps = self.timestamps();
+        let first_idx = wal_timestamps
+            .iter()
+            .cloned()
+            .rposition(|x| x < start_ts)
+            .unwrap_or(0);
+        let last_idx = wal_timestamps
+            .iter()
+            .cloned()
+            .rposition(|x| x < end_ts)
+            .unwrap_or(0);
+        // self.timestamps_wal[first_idx..last_idx].copy_from_slice()
+
         todo!()
     }
     fn get_stream_from_wal(&self, stream_id: u64, meta: ChartReqMetadata) -> Option<HotStream> {
         todo!()
     }
-    
 }
 
 async fn writable_get_chart_aggregated_batched(
@@ -607,37 +688,21 @@ impl TryFrom<&ReadOnlyTimePartitionFileHeader> for ReadOnlyTimePartition {
 impl TryFrom<&WritableTimePartitionFileHeader> for WritableTimePartition {
     type Error = io::Error;
     fn try_from(value: &WritableTimePartitionFileHeader) -> Result<Self, Self::Error> {
-        let timestamps_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&value.timestamps_file_path)?;
-        let timestamps_wal = unsafe { MmapMut::map_mut(&timestamps_file)? };
+        let timestamps_mmap = ResizableMmapMut::new(value.timestamps_file_path.as_path())?;
 
-        let stream_ids_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&value.stream_ids_file_path)?;
-
-        let stream_ids_wal = unsafe { MmapMut::map_mut(&stream_ids_file)? };
-
-        let values_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&value.timestamps_file_path)?;
-        let values_wal = unsafe { MmapMut::map_mut(&values_file)? };
+        let streams_mmap = ResizableMmapMut::new(value.stream_ids_file_path.as_path())?;
+        let values_mmap = ResizableMmapMut::new(value.values_file_path.as_path())?;
 
         let start_unix_s = value.start_unix_s;
         let streams = DashMap::new();
 
         Ok(Self {
             start_unix_s,
+            timestamps_mmap,
+            streams_mmap,
+            values_mmap,
             streams,
-            timestamps_wal,
-            stream_ids_wal,
-            values_wal,
+            len: value.len,
         })
     }
 }
@@ -768,6 +833,7 @@ impl Storage {
         let (readonly_partitions, writeable_partitions) = partitions_file_header
             .thaw()
             .map_err(StorageCreationError::IOError)?;
+
         let readonly_partitions = RwLock::new(readonly_partitions);
         let writable_partitions = RwLock::new(writeable_partitions);
 
@@ -781,12 +847,6 @@ impl Storage {
     }
 
     pub fn import_stream(&self, stream: ImportStream) -> Result<Self, ImportStreamError> {
-        if stream.stream_ids.len() != stream.timestamps.len()
-            || stream.stream_ids.len() != stream.values.len()
-        {
-            return Err(ImportStreamError::ColumnLengthMismatch);
-        }
-        
         todo!()
     }
 }

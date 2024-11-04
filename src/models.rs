@@ -49,7 +49,7 @@ pub struct StorageConfig {
     pub retention_period_s: usize,
     pub stream_cache_ttl_s: usize,
     pub data_frequency_s: usize,
-    pub partition_duration_s: usize,
+    pub writable_partition_size: usize,
     pub writable_partitions: usize,
 }
 

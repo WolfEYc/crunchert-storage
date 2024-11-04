@@ -7,9 +7,9 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             compression_level: 8,
-            retention_period_s: 31536000, //1y
-            partition_duration_s: 86400,  //1d
-            stream_cache_ttl_s: 900,      //15m
+            retention_period_s: 31536000,        //1y
+            stream_cache_ttl_s: 900,             //15m
+            writable_partition_size: 1296000000, // some made up sh*t
             writable_partitions: 2,
             data_frequency_s: 900, //15m
             data_storage_dir: PathBuf::from("/var/lib/wolfeymetrics"),
@@ -37,11 +37,11 @@ impl StorageConfig {
             return Err(StorageConfigError::ToLowWritablePartitions);
         }
 
-        if self.partition_duration_s < MIN_PARTITION_DURATION_S {
-            return Err(StorageConfigError::ToLowPartitionDuration);
+        if self.writable_partition_size < MIN_WRITEABLE_PARTITION_SIZE {
+            return Err(StorageConfigError::ToLowWritablePartitionSize);
         }
-        if self.partition_duration_s > MAX_PARTITION_DURATION_S {
-            return Err(StorageConfigError::ToHighPartitionDuration);
+        if self.writable_partition_size > MAX_WRITEABLE_PARTITION_SIZE {
+            return Err(StorageConfigError::ToHighWritablePartitionSize);
         }
         if self.data_frequency_s > MAX_DATA_FREQUENCY_S {
             return Err(StorageConfigError::ToHighDataFrequency);

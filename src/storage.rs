@@ -80,6 +80,12 @@ impl PartitionsFileHeader {
             writable_time_partitions: vec![WritableTimePartitionFileHeader::new(config)],
         }
     }
+
+    fn from_file(path: &Path) -> Result<Self, StorageCreationError> {
+        let bytes = std::fs::read(path)?;
+        Ok(postcard::from_bytes(&bytes)?)
+    }
+
     fn thaw(
         &self,
     ) -> Result<
@@ -195,27 +201,18 @@ impl Storage {
     }
 
     pub fn new(config: StorageConfig, num_threads: usize) -> Result<Self, StorageCreationError> {
-        let config = config
-            .validate()
-            .map_err(StorageCreationError::ConfigError)?;
-
+        let config = config.validate()?;
         let partitions_file_path = config
             .data_storage_dir
             .join(PARTITIONS_FILE_HEADER_FILENAME);
 
-        let partitions_file_header: PartitionsFileHeader = if partitions_file_path.exists() {
-            let partitions_file_header_bytes =
-                std::fs::read(partitions_file_path).map_err(StorageCreationError::IOError)?;
-            postcard::from_bytes(&partitions_file_header_bytes)
-                .map_err(StorageCreationError::DeserializationError)?
+        let partitions_file_header = if partitions_file_path.exists() {
+            PartitionsFileHeader::from_file(&partitions_file_path)?
         } else {
             PartitionsFileHeader::new(&config)
         };
 
-        let (readonly_partitions, writeable_partitions) = partitions_file_header
-            .thaw()
-            .map_err(StorageCreationError::IOError)?;
-
+        let (readonly_partitions, writeable_partitions) = partitions_file_header.thaw()?;
         let readonly_partitions = RwLock::new(readonly_partitions);
         let writable_partitions = RwLock::new(writeable_partitions);
 

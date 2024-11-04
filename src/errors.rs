@@ -1,4 +1,5 @@
 use crate::constants::*;
+use postcard;
 use std::io;
 
 #[derive(thiserror::Error, Debug)]
@@ -28,12 +29,12 @@ pub enum StorageConfigError {
     ToLowRetentionPeriod,
     #[error("RETENTION_PERIOD_S must be <= {MAX_RETENTION_PERIOD_S}")]
     ToHighRetentionPeriod,
-    #[error("WRITEABLE_PARTITIONS must be >= {MIN_WRITEABLE_PARTITIONS}")]
+    #[error("WRITABLE_PARTITIONS must be >= {MIN_WRITEABLE_PARTITIONS}")]
     ToLowWritablePartitions,
-    #[error("PARTITION_DURATION_S must be >= {MIN_PARTITION_DURATION_S}")]
-    ToLowPartitionDuration,
-    #[error("PARTITION_DURATION_S must be <= {MAX_PARTITION_DURATION_S}")]
-    ToHighPartitionDuration,
+    #[error("WRITABLE_PARTITION_SIZE must be >= {MIN_WRITEABLE_PARTITION_SIZE}")]
+    ToLowWritablePartitionSize,
+    #[error("WRITABLE_PARTITION_SIZE must be <= {MAX_WRITEABLE_PARTITION_SIZE}")]
+    ToHighWritablePartitionSize,
     #[error("DATA_FREQUENCY_S must be <= {MAX_DATA_FREQUENCY_S}")]
     ToHighDataFrequency,
 }

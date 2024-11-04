@@ -6,5 +6,5 @@ pub const MIN_RETENTION_PERIOD_S: usize = 900; //15m
 pub const MAX_RETENTION_PERIOD_S: usize = 3156000000; //100y
 pub const MIN_WRITEABLE_PARTITIONS: usize = 2;
 pub const MAX_DATA_FREQUENCY_S: usize = 86400;
-pub const MIN_PARTITION_DURATION_S: usize = 3600;
-pub const MAX_PARTITION_DURATION_S: usize = 31536000; //1y
+pub const MIN_WRITEABLE_PARTITION_SIZE: usize = u16::MAX as usize;
+pub const MAX_WRITEABLE_PARTITION_SIZE: usize = u32::MAX as usize;

@@ -145,15 +145,16 @@ impl ReadOnlyStream {
         aggregated_result: Vec<ValueTracker>,
         agg: Aggregation,
     ) -> Vec<ValueTracker> {
-        let mut last_accessed_lock = self.last_accessed.lock().await;
-        *last_accessed_lock = Some(Utc::now().timestamp());
-        drop(last_accessed_lock);
-
-        let hot_stream_option = self.hot_stream.read().await;
-        if let Some(ref x) = *hot_stream_option {
-            return x.add_stream_to_chart(req, aggregated_result, agg);
+        {
+            let mut last_accessed_lock = self.last_accessed.lock().await;
+            *last_accessed_lock = Some(Utc::now().timestamp());
         }
-        drop(hot_stream_option);
+        {
+            let hot_stream_option = self.hot_stream.read().await;
+            if let Some(ref x) = *hot_stream_option {
+                return x.add_stream_to_chart(req, aggregated_result, agg);
+            }
+        }
 
         let mut writable_hot_stream = self.hot_stream.write().await;
 

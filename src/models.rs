@@ -120,7 +120,7 @@ pub struct Storage {
     pub config: StorageConfig,
     pub partitions_file_header: PartitionsFileHeader,
     pub readonly_partitions: RwLock<Vec<Arc<ReadOnlyTimePartition>>>,
-    pub writable_partitions: RwLock<Vec<Arc<WritableTimePartition>>>,
+    pub writable_partitions: RwLock<Vec<Arc<RwLock<WritableTimePartition>>>>,
     pub num_threads: usize,
 }
 

@@ -1,6 +1,7 @@
 use crate::constants::*;
 use crate::errors::*;
 use crate::models::*;
+use crate::readchart::writable_time_partition_get_agg_chart;
 use chrono::Utc;
 use dashmap::DashMap;
 use itertools::Itertools;
@@ -91,7 +92,7 @@ impl PartitionsFileHeader {
     ) -> Result<
         (
             Vec<Arc<ReadOnlyTimePartition>>,
-            Vec<Arc<WritableTimePartition>>,
+            Vec<Arc<RwLock<WritableTimePartition>>>,
         ),
         io::Error,
     > {
@@ -105,7 +106,7 @@ impl PartitionsFileHeader {
             .writable_time_partitions
             .iter()
             .map(WritableTimePartition::try_from)
-            .process_results(|iter| iter.map(Arc::new).collect())?;
+            .process_results(|iter| iter.map(RwLock::new).map(Arc::new).collect())?;
 
         Ok((readonly_partitions, writable_partitions))
     }
@@ -153,16 +154,18 @@ impl Storage {
         &self,
         start_unix_s: i64,
         stop_unix_s: i64,
-    ) -> Vec<Arc<WritableTimePartition>> {
+    ) -> Vec<Arc<RwLock<WritableTimePartition>>> {
         let mut partition_end = Utc::now().timestamp();
         let mut partitions_in_range = Vec::new();
         let partitions = self.writable_partitions.read().await;
+
         for partition in partitions.iter() {
+            let readable_partition = partition.read().await;
             if start_unix_s > partition_end {
                 return partitions_in_range;
             }
-            partition_end = partition.start_unix_s;
-            if stop_unix_s < partition.start_unix_s {
+            partition_end = readable_partition.start_unix_s;
+            if stop_unix_s < readable_partition.start_unix_s {
                 continue;
             }
             partitions_in_range.push(partition.clone());
@@ -182,7 +185,7 @@ impl Storage {
             x.read_only_time_partition_get_agg_chart(arc_req.clone(), agg, self.num_threads)
         });
         let writable_datapoint_jobs = writable_time_partitions.into_iter().map(|x| {
-            x.writable_time_partition_get_agg_chart(arc_req.clone(), agg, self.num_threads)
+            writable_time_partition_get_agg_chart(x, arc_req.clone(), agg, self.num_threads)
         });
 
         let read_only_datapoints_nested = JoinSet::from_iter(read_only_datapoint_jobs).join_all();
@@ -225,7 +228,45 @@ impl Storage {
         })
     }
 
-    pub fn import_stream(&self, stream: ImportStream) -> Result<Self, ImportStreamError> {
+    pub async fn import_stream(&self, mut stream: ImportStream) -> Result<(), ImportStreamError> {
+        stream.pts.sort_unstable();
+        let first_ts = stream.pts.first().unwrap().timestamp;
+        let last_ts = stream.pts.last().unwrap().timestamp;
+
+        let writeable_partitions = self
+            .get_writable_partitions_in_range(first_ts, last_ts)
+            .await;
+
+        if writeable_partitions.len() == 0 {
+            todo!();
+        }
+
+        //TODO split the points better and dont cause a off by 1 error
+
+        writeable_partitions
+            .first()
+            .unwrap()
+            .write()
+            .await
+            .import_stream(stream.pts)
+            .await;
+
+        if writeable_partitions.len() == 1 {
+            return Ok(());
+        }
+
+        for i in 1..writeable_partitions.len() {
+            let prev = writeable_partitions[i - 1].read().await;
+            let curr = writeable_partitions[i].read().await;
+
+            let start_idx = stream
+                .pts
+                .binary_search_by_key(&prev.start_unix_s, |x| x.timestamp);
+            let end_idx = stream
+                .pts
+                .binary_search_by_key(&curr.start_unix_s, |x| x.timestamp);
+        }
+
         todo!()
     }
 }

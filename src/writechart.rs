@@ -88,13 +88,9 @@ impl WritableTimePartition {
         self.values_mmap.align_to_mut(self.len)
     }
 
-    pub async fn import_stream(&mut self, mut stream: ImportStream) {
-        assert!(stream.pts.len() > 0);
-
-        stream.pts.sort_unstable();
-
-        let start_ts = stream.pts.first().unwrap().timestamp;
-        let end_ts = stream.pts.last().unwrap().timestamp;
+    pub async fn import_stream(&mut self, mut stream: Vec<StreamPoint>) {
+        let start_ts = stream.first().unwrap().timestamp;
+        let end_ts = stream.last().unwrap().timestamp;
 
         let first_idx: usize;
         let last_idx: usize;
@@ -116,7 +112,7 @@ impl WritableTimePartition {
 
         let r_offset_count = self.len - last_idx - 1;
         let prev_len = self.len;
-        self.len += stream.pts.len();
+        self.len += stream.len();
 
         if r_offset_count > 0 {
             // need to memmove the pts to the right of the insertion block
@@ -147,23 +143,23 @@ impl WritableTimePartition {
                 stream_id,
                 value,
             });
-            stream.pts = stream.pts.into_iter().merge(as_stream_points).collect();
+            stream = stream.into_iter().merge(as_stream_points).collect();
         }
 
-        let src = first_idx..first_idx + stream.pts.len();
+        let src = first_idx..first_idx + stream.len();
 
         {
-            let timestamps_from_stream: Vec<i64> = stream.pts.iter().map(|x| x.timestamp).collect();
+            let timestamps_from_stream: Vec<i64> = stream.iter().map(|x| x.timestamp).collect();
             let timestamps = self.timestamps_mut();
             timestamps[src.clone()].copy_from_slice(&timestamps_from_stream)
         }
         {
-            let stream_ids_from_stream: Vec<u64> = stream.pts.iter().map(|x| x.stream_id).collect();
+            let stream_ids_from_stream: Vec<u64> = stream.iter().map(|x| x.stream_id).collect();
             let stream_ids = self.stream_ids_mut();
             stream_ids[src.clone()].copy_from_slice(&stream_ids_from_stream)
         }
         {
-            let values_from_stream: Vec<f32> = stream.pts.iter().map(|x| x.value).collect();
+            let values_from_stream: Vec<f32> = stream.iter().map(|x| x.value).collect();
             let values = self.values_mut();
             values[src].copy_from_slice(&values_from_stream)
         }

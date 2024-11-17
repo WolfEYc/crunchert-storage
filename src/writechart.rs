@@ -1,4 +1,4 @@
-use itertools::{izip, Itertools};
+use itertools::Itertools;
 use std::ops::Bound;
 use std::ops::RangeBounds;
 use tokio::sync::RwLock;
@@ -60,112 +60,84 @@ impl ResizableMmapMut {
 }
 
 impl WritableTimePartition {
-    fn timestamps(&self) -> &[i64] {
-        self.timestamps_mmap.align_to(self.len)
+    fn stream(&self) -> StreamPointSlice {
+        StreamPointSlice {
+            timestamp: self.timestamps_mmap.align_to(self.len),
+            stream_id: self.streams_mmap.align_to(self.len),
+            value: self.values_mmap.align_to(self.len),
+        }
     }
-    fn timestamps_range(&self, range: impl RangeBounds<usize>) -> &[i64] {
-        self.timestamps_mmap.align_to_range(range, self.len)
+    fn stream_mut(&mut self) -> StreamPointSliceMut {
+        StreamPointSliceMut {
+            timestamp: self.timestamps_mmap.align_to_mut(self.len),
+            stream_id: self.streams_mmap.align_to_mut(self.len),
+            value: self.values_mmap.align_to_mut(self.len),
+        }
     }
-    fn stream_ids(&self) -> &[u64] {
-        self.streams_mmap.align_to(self.len)
-    }
-
-    fn stream_ids_range(&self, range: impl RangeBounds<usize>) -> &[u64] {
-        self.streams_mmap.align_to_range(range, self.len)
-    }
-    fn values_range(&self, range: impl RangeBounds<usize>) -> &[f32] {
-        self.values_mmap.align_to_range(range, self.len)
-    }
-    fn values(&self) -> &[f32] {
-        self.values_mmap.align_to(self.len)
-    }
-    fn timestamps_mut(&mut self) -> &mut [i64] {
-        self.timestamps_mmap.align_to_mut(self.len)
-    }
-    fn stream_ids_mut(&mut self) -> &mut [u64] {
-        self.streams_mmap.align_to_mut(self.len)
-    }
-    fn values_mut(&mut self) -> &mut [f32] {
-        self.values_mmap.align_to_mut(self.len)
+    fn stream_range<R: RangeBounds<usize> + Clone>(&self, range: R) -> StreamPointSlice {
+        StreamPointSlice {
+            timestamp: self.timestamps_mmap.align_to_range(range.clone(), self.len),
+            stream_id: self.streams_mmap.align_to_range(range.clone(), self.len),
+            value: self.values_mmap.align_to_range(range, self.len),
+        }
     }
 }
-pub async fn import_stream(partition: RwLock<WritableTimePartition>, mut stream: Vec<StreamPoint>) {
+pub async fn import_stream(partition: RwLock<WritableTimePartition>, mut stream: StreamPointVec) {
     let last_idx: usize;
     let first_idx: usize;
     {
-        let start_ts = stream.first().unwrap().timestamp;
-        let end_ts = stream.last().unwrap().timestamp;
-        let readable_partition = partition.read().await;
+        let start_ts = *stream.timestamp.first().unwrap();
+        let end_ts = *stream.timestamp.last().unwrap();
 
-        {
-            let wal_timestamps = readable_partition.timestamps();
-            first_idx = wal_timestamps
-                .iter()
-                .cloned()
-                .rposition(|x| x <= start_ts)
-                .unwrap_or(0);
-            last_idx = wal_timestamps
-                .iter()
-                .cloned()
-                .rposition(|x| x < end_ts)
-                .unwrap_or(0);
-        }
+        let readable_partition = partition.read().await;
+        let readable_stream = readable_partition.stream();
+
+        first_idx = readable_stream
+            .timestamp
+            .iter()
+            .cloned()
+            .rposition(|x| x <= start_ts)
+            .unwrap_or(0);
+        last_idx = readable_stream
+            .timestamp
+            .iter()
+            .cloned()
+            .rposition(|x| x < end_ts)
+            .unwrap_or(0);
         assert!(first_idx <= last_idx);
 
         if first_idx < last_idx {
             let range = first_idx..=last_idx;
-            let timestamps = readable_partition.timestamps_range(range.clone());
-            let stream_ids = readable_partition.stream_ids_range(range.clone());
-            let values = readable_partition.values_range(range);
-            let merge_pts = izip!(timestamps, stream_ids, values);
-            let as_stream_points = merge_pts.map(|(&timestamp, &stream_id, &value)| StreamPoint {
-                timestamp,
-                stream_id,
-                value,
-            });
-            stream = stream.into_iter().merge(as_stream_points).collect();
+            let readable_stream_merge_pts = readable_stream.index(range);
+            let owned_merge_pts = readable_stream_merge_pts.iter().map(|x| x.to_owned());
+            stream = stream
+                .into_iter()
+                .map(|x| x.to_owned())
+                .merge(owned_merge_pts)
+                .collect();
         }
     }
-
-    let timestamps_from_stream: Vec<i64> = stream.iter().map(|x| x.timestamp).collect();
-    let stream_ids_from_stream: Vec<u64> = stream.iter().map(|x| x.stream_id).collect();
-    let values_from_stream: Vec<f32> = stream.iter().map(|x| x.value).collect();
 
     {
         let mut writable_partition = partition.write().await;
         let r_offset_count = writable_partition.len - last_idx - 1;
         let prev_len = writable_partition.len;
         writable_partition.len += stream.len();
+
+        let dest = writable_partition.len - r_offset_count;
+        let writable_streams = writable_partition.stream_mut();
+
         if r_offset_count > 0 {
             // need to memmove the pts to the right of the insertion block
-            let dest = writable_partition.len - r_offset_count;
             let src = last_idx..prev_len;
-            {
-                let timestamps = writable_partition.timestamps_mut();
-                timestamps.copy_within(src.clone(), dest);
-            }
-            {
-                let stream_ids = writable_partition.stream_ids_mut();
-                stream_ids.copy_within(src.clone(), dest);
-            }
-            {
-                let values = writable_partition.values_mut();
-                values.copy_within(src, dest);
-            }
+            writable_streams.timestamp.copy_within(src.clone(), dest);
+            writable_streams.stream_id.copy_within(src.clone(), dest);
+            writable_streams.value.copy_within(src, dest);
         }
 
         let src = first_idx..first_idx + stream.len();
-        {
-            let timestamps = writable_partition.timestamps_mut();
-            timestamps[src.clone()].copy_from_slice(&timestamps_from_stream)
-        }
-        {
-            let stream_ids = writable_partition.stream_ids_mut();
-            stream_ids[src.clone()].copy_from_slice(&stream_ids_from_stream)
-        }
-        {
-            let values = writable_partition.values_mut();
-            values[src].copy_from_slice(&values_from_stream)
-        }
+        writable_streams.timestamp[src.clone()].copy_from_slice(&stream.timestamp);
+        writable_streams.stream_id[src.clone()].copy_from_slice(&stream.stream_id);
+        writable_streams.value[src].copy_from_slice(&stream.value);
     }
 }

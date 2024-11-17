@@ -233,38 +233,28 @@ impl Storage {
         let first_ts = stream.pts.first().unwrap().timestamp;
         let last_ts = stream.pts.last().unwrap().timestamp;
 
-        let writeable_partitions = self
-            .get_writable_partitions_in_range(first_ts, last_ts)
-            .await;
+        let writable_partitions = self.writable_partitions.read().await;
+        assert!(writable_partitions.len() != 0);
+        let mut import_joinset = JoinSet::new();
+        for partition in writable_partitions.iter().rev() {
+            let start_idx = {
+                let readable_partition = partition.read().await;
+                let start_idx = stream
+                    .pts
+                    .binary_search_by_key(&readable_partition.start_unix_s, |x| x.timestamp)
+                    .unwrap_or_else(|x| x);
+                if start_idx == stream.pts.len() {
+                    None
+                } else {
+                    Some(start_idx)
+                }
+            };
 
-        if writeable_partitions.len() == 0 {
-            todo!();
-        }
-
-        //TODO split the points better and dont cause a off by 1 error
-
-        writeable_partitions
-            .first()
-            .unwrap()
-            .write()
-            .await
-            .import_stream(stream.pts)
-            .await;
-
-        if writeable_partitions.len() == 1 {
-            return Ok(());
-        }
-
-        for i in 1..writeable_partitions.len() {
-            let prev = writeable_partitions[i - 1].read().await;
-            let curr = writeable_partitions[i].read().await;
-
-            let start_idx = stream
-                .pts
-                .binary_search_by_key(&prev.start_unix_s, |x| x.timestamp);
-            let end_idx = stream
-                .pts
-                .binary_search_by_key(&curr.start_unix_s, |x| x.timestamp);
+            let Some(start_idx) = start_idx else {
+                return Ok(());
+            };
+            let stream_pts = stream.pts.drain(start_idx..);
+            let import_job = partition.write().await.import_stream(stream_pts);
         }
 
         todo!()

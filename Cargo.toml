@@ -18,6 +18,7 @@ memmap2 = "0.9.5"
 pco = "0.3.1"
 postcard = "1.0.10"
 serde = { version = "1.0.210", features = ["derive"] }
+soa_derive = "0.13.0"
 thiserror = "1.0.64"
 tokio = { version = "1.40.0", features = ["full", "tracing"] }
 tracing = "0.1.40"

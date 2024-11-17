@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use memmap2::{Mmap, MmapMut};
 use serde::{Deserialize, Serialize};
+use soa_derive::StructOfArray;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ pub struct ValueTracker {
     pub value: f32,
     pub count: u32,
 }
+#[derive(StructOfArray)]
 pub struct StreamPoint {
     pub timestamp: i64,
     pub stream_id: u64,

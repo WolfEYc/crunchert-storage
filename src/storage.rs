@@ -2,6 +2,7 @@ use crate::constants::*;
 use crate::errors::*;
 use crate::models::*;
 use crate::readchart::writable_time_partition_get_agg_chart;
+use crate::writechart::write_stream;
 use chrono::Utc;
 use dashmap::DashMap;
 use itertools::Itertools;
@@ -228,35 +229,31 @@ impl Storage {
         })
     }
 
-    pub async fn import_stream(&self, mut stream: ImportStream) -> Result<(), ImportStreamError> {
-        stream.pts.sort_unstable();
-        let first_ts = stream.pts.first().unwrap().timestamp;
-        let last_ts = stream.pts.last().unwrap().timestamp;
+    pub async fn import_stream(&self, mut stream: ImportStream) {
+        assert!(!stream.pts.is_empty());
 
+        stream.pts.as_mut_slice().sort_by_key(|x| *x.timestamp);
         let writable_partitions = self.writable_partitions.read().await;
+
         assert!(writable_partitions.len() != 0);
+
         let mut import_joinset = JoinSet::new();
-        for partition in writable_partitions.iter().rev() {
-            let start_idx = {
-                let readable_partition = partition.read().await;
-                let start_idx = stream
-                    .pts
-                    .binary_search_by_key(&readable_partition.start_unix_s, |x| x.timestamp)
-                    .unwrap_or_else(|x| x);
-                if start_idx == stream.pts.len() {
-                    None
-                } else {
-                    Some(start_idx)
-                }
-            };
+        for partition in writable_partitions.iter().cloned().rev() {
+            let start_unix_s = partition.read().await.start_unix_s;
 
-            let Some(start_idx) = start_idx else {
-                return Ok(());
-            };
-            let stream_pts = stream.pts.drain(start_idx..);
-            let import_job = partition.write().await.import_stream(stream_pts);
+            let start_idx = stream
+                .pts
+                .timestamp
+                .binary_search(&start_unix_s)
+                .unwrap_or_else(|x| x);
+
+            if start_idx == stream.pts.len() {
+                return;
+            }
+
+            let stream_pts = stream.pts.split_off(start_idx);
+            import_joinset.spawn(write_stream(partition, stream_pts));
         }
-
-        todo!()
+        import_joinset.join_all().await;
     }
 }

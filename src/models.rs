@@ -20,7 +20,7 @@ pub struct StreamPoint {
 }
 
 pub struct ImportStream {
-    pub pts: Vec<StreamPoint>,
+    pub pts: StreamPointVec,
 }
 
 #[derive(Clone, Copy)]

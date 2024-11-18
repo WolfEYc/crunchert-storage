@@ -1,6 +1,7 @@
 use itertools::Itertools;
 use std::ops::Bound;
 use std::ops::RangeBounds;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::models::*;
@@ -82,7 +83,10 @@ impl WritableTimePartition {
         }
     }
 }
-pub async fn import_stream(partition: RwLock<WritableTimePartition>, mut stream: StreamPointVec) {
+pub async fn write_stream(
+    partition: Arc<RwLock<WritableTimePartition>>,
+    mut stream: StreamPointVec,
+) {
     let last_idx: usize;
     let first_idx: usize;
     {

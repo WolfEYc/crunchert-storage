@@ -1,6 +1,4 @@
 use itertools::Itertools;
-use std::ops::Bound;
-use std::ops::RangeBounds;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -34,24 +32,6 @@ impl ResizableMmapMut {
             res
         }
     }
-    fn align_to_range<T>(&self, range: impl RangeBounds<usize>, len: usize) -> &[T] {
-        let remapped_start = match range.start_bound() {
-            Bound::Included(x) => (x + 1) * size_of::<T>(),
-            Bound::Excluded(x) => x * size_of::<T>(),
-            Bound::Unbounded => 0,
-        };
-        let remapped_end = match range.end_bound() {
-            Bound::Included(x) => (x + 1) * size_of::<T>(),
-            Bound::Excluded(x) => x * size_of::<T>(),
-            Bound::Unbounded => len,
-        };
-        let remapped_range = remapped_start..remapped_end;
-        unsafe {
-            let (_, res, _) = self.mmap[remapped_range].align_to();
-            res
-        }
-    }
-
     fn align_to_mut<T>(&mut self, len: usize) -> &mut [T] {
         unsafe {
             let (_, res, _) = self.mmap[..len].align_to_mut();
@@ -73,13 +53,6 @@ impl WritableTimePartition {
             timestamp: self.timestamps_mmap.align_to_mut(self.len),
             stream_id: self.streams_mmap.align_to_mut(self.len),
             value: self.values_mmap.align_to_mut(self.len),
-        }
-    }
-    fn stream_range<R: RangeBounds<usize> + Clone>(&self, range: R) -> StreamPointSlice {
-        StreamPointSlice {
-            timestamp: self.timestamps_mmap.align_to_range(range.clone(), self.len),
-            stream_id: self.streams_mmap.align_to_range(range.clone(), self.len),
-            value: self.values_mmap.align_to_range(range, self.len),
         }
     }
 }

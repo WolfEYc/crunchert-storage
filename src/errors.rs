@@ -11,13 +11,6 @@ pub enum StorageCreationError {
     #[error("postcard deserialization error")]
     DeserializationError(#[from] postcard::Error),
 }
-#[derive(thiserror::Error, Debug)]
-pub enum ImportStreamError {
-    #[error("io error")]
-    IOError(#[from] io::Error),
-    #[error("input must be non empty")]
-    EmptyInputError,
-}
 
 #[derive(thiserror::Error, Debug)]
 pub enum StorageConfigError {

@@ -229,7 +229,7 @@ impl Storage {
         })
     }
 
-    pub async fn import_stream(&self, mut stream: ImportStream) {
+    async fn write_streams(&self, mut stream: ImportStream) {
         assert!(!stream.pts.is_empty());
 
         stream.pts.as_mut_slice().sort_by_key(|x| *x.timestamp);
@@ -248,12 +248,22 @@ impl Storage {
                 .unwrap_or_else(|x| x);
 
             if start_idx == stream.pts.len() {
-                return;
+                break;
             }
 
             let stream_pts = stream.pts.split_off(start_idx);
             import_joinset.spawn(write_stream(partition, stream_pts));
+            if stream.pts.is_empty() {
+                break;
+            }
         }
         import_joinset.join_all().await;
+    }
+
+    pub async fn import_streams(&self, stream: ImportStream) -> Result<(), io::Error> {
+        self.write_streams(stream).await;
+
+        // TODO create new writable stream if latest is > 75% full
+        Ok(())
     }
 }

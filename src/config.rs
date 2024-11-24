@@ -12,6 +12,7 @@ impl Default for StorageConfig {
             writable_partition_size: 1296000000, // some made up sh*t
             writable_partitions: 2,
             data_frequency_s: 900, //15m
+            writable_partition_ideal_pct_full: 0.75,
             data_storage_dir: PathBuf::from("/var/lib/wolfeymetrics"),
         }
     }
@@ -45,6 +46,12 @@ impl StorageConfig {
         }
         if self.data_frequency_s > MAX_DATA_FREQUENCY_S {
             return Err(StorageConfigError::ToHighDataFrequency);
+        }
+        if self.writable_partition_ideal_pct_full < MIN_WRITABLE_PARTITION_IDEAL_PCT_FULL {
+            return Err(StorageConfigError::ToLowWritablePartitionIdealPctFull);
+        }
+        if self.writable_partition_ideal_pct_full > MAX_WRITABLE_PARTITION_IDEAL_PCT_FULL {
+            return Err(StorageConfigError::ToHighWritablePartitionSize);
         }
 
         Ok(self)

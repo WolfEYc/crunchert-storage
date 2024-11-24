@@ -2,9 +2,9 @@ use dashmap::DashMap;
 use memmap2::{Mmap, MmapMut};
 use serde::{Deserialize, Serialize};
 use soa_derive::StructOfArray;
-use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::{fs::File, marker::PhantomData};
 use tokio::sync::{Mutex, RwLock};
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -52,6 +52,7 @@ pub struct StorageConfig {
     pub stream_cache_ttl_s: usize,
     pub data_frequency_s: usize,
     pub writable_partition_size: usize,
+    pub writable_partition_ideal_pct_full: f32,
     pub writable_partitions: usize,
 }
 
@@ -74,6 +75,7 @@ pub struct ReadOnlyTimePartitionFileHeader {
 pub struct WritableTimePartitionFileHeader {
     pub start_unix_s: i64,
     pub len: usize,
+    pub cap: usize,
     pub timestamps_file_path: PathBuf,
     pub stream_ids_file_path: PathBuf,
     pub values_file_path: PathBuf,
@@ -104,23 +106,25 @@ pub struct ReadOnlyTimePartition {
     pub streams: DashMap<u64, ReadOnlyStream>,
 }
 
-pub struct ResizableMmapMut {
+pub struct ResizableMmapMut<T> {
     pub mmap: MmapMut,
     pub file: File,
+    pub cap: usize,
+    pub item: PhantomData<T>,
 }
 
 pub struct WritableTimePartition {
     pub len: usize,
     pub start_unix_s: i64,
-    pub timestamps_mmap: ResizableMmapMut,
-    pub streams_mmap: ResizableMmapMut,
-    pub values_mmap: ResizableMmapMut,
+    pub timestamps_mmap: ResizableMmapMut<i64>,
+    pub streams_mmap: ResizableMmapMut<u64>,
+    pub values_mmap: ResizableMmapMut<f32>,
     pub streams: DashMap<u64, RwLock<HotStream>>,
 }
 
 pub struct Storage {
     pub config: StorageConfig,
-    pub partitions_file_header: PartitionsFileHeader,
+    pub partitions_file_header: RwLock<PartitionsFileHeader>,
     pub readonly_partitions: RwLock<Vec<Arc<ReadOnlyTimePartition>>>,
     pub writable_partitions: RwLock<Vec<Arc<RwLock<WritableTimePartition>>>>,
     pub num_threads: usize,

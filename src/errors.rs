@@ -30,4 +30,12 @@ pub enum StorageConfigError {
     ToHighWritablePartitionSize,
     #[error("DATA_FREQUENCY_S must be <= {MAX_DATA_FREQUENCY_S}")]
     ToHighDataFrequency,
+    #[error(
+        "WRITABLE_PARTITION_IDEAL_PCT_FULL must be >= {MIN_WRITABLE_PARTITION_IDEAL_PCT_FULL}"
+    )]
+    ToLowWritablePartitionIdealPctFull,
+    #[error(
+        "WRITABLE_PARTITION_IDEAL_PCT_FULL must be <= {MAX_WRITABLE_PARTITION_IDEAL_PCT_FULL}"
+    )]
+    ToHighWritablePartitionIdealPctFull,
 }

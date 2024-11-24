@@ -14,24 +14,30 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 
-impl ResizableMmapMut {
-    fn new(path: &Path) -> Result<Self, io::Error> {
+impl<T> ResizableMmapMut<T> {
+    fn new(path: &Path, cap: usize) -> Result<Self, io::Error> {
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .open(path)?;
+        let cap_in_bytes = cap * size_of::<T>();
+        file.set_len(cap_in_bytes as u64)?;
         let mmap = unsafe { MmapMut::map_mut(&file)? };
         mmap.advise(memmap2::Advice::Sequential)?;
 
-        Ok(Self { mmap, file })
+        Ok(Self {
+            mmap,
+            file,
+            cap,
+            item: std::marker::PhantomData::<T>,
+        })
     }
 }
 
-impl TryFrom<&ReadOnlyTimePartitionFileHeader> for ReadOnlyTimePartition {
-    type Error = io::Error;
-    fn try_from(value: &ReadOnlyTimePartitionFileHeader) -> Result<Self, Self::Error> {
-        let hash_map_iter = value.disk_streams.iter().cloned().map(|x| {
+impl ReadOnlyTimePartitionFileHeader {
+    fn materialize(self: &Self) -> Result<ReadOnlyTimePartition, io::Error> {
+        let hash_map_iter = self.disk_streams.iter().cloned().map(|x| {
             (
                 x.stream_id,
                 ReadOnlyStream {
@@ -42,36 +48,53 @@ impl TryFrom<&ReadOnlyTimePartitionFileHeader> for ReadOnlyTimePartition {
             )
         });
 
-        let file = fs::File::open(&value.file_path)?;
+        let file = fs::File::open(&self.file_path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         let streams = DashMap::from_iter(hash_map_iter);
-        let start_unix_s = value.start_unix_s;
-        Ok(Self {
+        let start_unix_s = self.start_unix_s;
+        Ok(ReadOnlyTimePartition {
             start_unix_s,
             streams,
             mmap,
         })
     }
 }
+impl WritableTimePartitionFileHeader {
+    fn new(config: &StorageConfig) -> Self {
+        let start_unix_s = Utc::now().timestamp();
+        let file_path = config.data_storage_dir.join(start_unix_s.to_string());
+        let timestamps_file_path = file_path.join("timestamps");
+        let stream_ids_file_path = file_path.join("stream_ids");
+        let values_file_path = file_path.join("values");
+        let cap = config.writable_partition_size;
 
-impl TryFrom<&WritableTimePartitionFileHeader> for WritableTimePartition {
-    type Error = io::Error;
-    fn try_from(value: &WritableTimePartitionFileHeader) -> Result<Self, Self::Error> {
-        let timestamps_mmap = ResizableMmapMut::new(value.timestamps_file_path.as_path())?;
+        Self {
+            len: 0,
+            cap,
+            start_unix_s,
+            timestamps_file_path,
+            stream_ids_file_path,
+            values_file_path,
+        }
+    }
+    fn materialize(
+        self: &WritableTimePartitionFileHeader,
+    ) -> Result<WritableTimePartition, io::Error> {
+        let timestamps_mmap = ResizableMmapMut::new(self.timestamps_file_path.as_path(), self.cap)?;
 
-        let streams_mmap = ResizableMmapMut::new(value.stream_ids_file_path.as_path())?;
-        let values_mmap = ResizableMmapMut::new(value.values_file_path.as_path())?;
+        let streams_mmap = ResizableMmapMut::new(self.stream_ids_file_path.as_path(), self.cap)?;
+        let values_mmap = ResizableMmapMut::new(self.values_file_path.as_path(), self.cap)?;
 
-        let start_unix_s = value.start_unix_s;
+        let start_unix_s = self.start_unix_s;
         let streams = DashMap::new();
 
-        Ok(Self {
+        Ok(WritableTimePartition {
             start_unix_s,
             timestamps_mmap,
             streams_mmap,
             values_mmap,
             streams,
-            len: value.len,
+            len: self.len,
         })
     }
 }
@@ -100,35 +123,19 @@ impl PartitionsFileHeader {
         let readonly_partitions = self
             .read_only_time_partitions
             .iter()
-            .map(ReadOnlyTimePartition::try_from)
+            .map(ReadOnlyTimePartitionFileHeader::materialize)
             .process_results(|iter| iter.map(Arc::new).collect())?;
 
         let writable_partitions = self
             .writable_time_partitions
             .iter()
-            .map(WritableTimePartition::try_from)
+            .map(WritableTimePartitionFileHeader::materialize)
             .process_results(|iter| iter.map(RwLock::new).map(Arc::new).collect())?;
 
         Ok((readonly_partitions, writable_partitions))
     }
 }
 
-impl WritableTimePartitionFileHeader {
-    fn new(config: &StorageConfig) -> Self {
-        let start_unix_s = Utc::now().timestamp();
-        let file_path = config.data_storage_dir.join(start_unix_s.to_string());
-        let timestamps_file_path = file_path.join("timestamps");
-        let stream_ids_file_path = file_path.join("stream_ids");
-        let values_file_path = file_path.join("values");
-        Self {
-            len: 0,
-            start_unix_s,
-            timestamps_file_path,
-            stream_ids_file_path,
-            values_file_path,
-        }
-    }
-}
 impl Storage {
     async fn get_read_only_partitions_in_range(
         &self,
@@ -219,6 +226,7 @@ impl Storage {
         let (readonly_partitions, writeable_partitions) = partitions_file_header.thaw()?;
         let readonly_partitions = RwLock::new(readonly_partitions);
         let writable_partitions = RwLock::new(writeable_partitions);
+        let partitions_file_header = RwLock::new(partitions_file_header);
 
         Ok(Self {
             config,
@@ -259,11 +267,35 @@ impl Storage {
         }
         import_joinset.join_all().await;
     }
+    async fn start_next_stream(&self) -> Result<(), io::Error> {
+        let new_writable_partition_file_header = WritableTimePartitionFileHeader::new(&self.config);
+        let writable_partition = new_writable_partition_file_header.materialize()?;
+        {
+            let mut writable_partitions_file_header = self.partitions_file_header.write().await;
+            writable_partitions_file_header
+                .writable_time_partitions
+                .push(new_writable_partition_file_header);
+        }
+        {
+            let mut writable_writable_partitions = self.writable_partitions.write().await;
+            writable_writable_partitions.push(Arc::new(RwLock::new(writable_partition)));
+        }
+        Ok(())
+    }
+    async fn need_new_writable_partition(&self) -> bool {
+        let readable_writable_partitions = self.writable_partitions.read().await;
+        let last_readable_writable_partition =
+            readable_writable_partitions.last().unwrap().read().await;
+        last_readable_writable_partition.pct_full() > self.config.writable_partition_ideal_pct_full
+    }
 
     pub async fn import_streams(&self, stream: ImportStream) -> Result<(), io::Error> {
         self.write_streams(stream).await;
 
-        // TODO create new writable stream if latest is > 75% full
+        if self.need_new_writable_partition().await {
+            self.start_next_stream().await?;
+        }
+
         Ok(())
     }
 }

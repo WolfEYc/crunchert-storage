@@ -25,14 +25,14 @@ impl PartialOrd for StreamPoint {
     }
 }
 
-impl ResizableMmapMut {
-    fn align_to<T>(&self, len: usize) -> &[T] {
+impl<T> ResizableMmapMut<T> {
+    fn align_to(&self, len: usize) -> &[T] {
         unsafe {
             let (_, res, _) = self.mmap[..len].align_to();
             res
         }
     }
-    fn align_to_mut<T>(&mut self, len: usize) -> &mut [T] {
+    fn align_to_mut(&mut self, len: usize) -> &mut [T] {
         unsafe {
             let (_, res, _) = self.mmap[..len].align_to_mut();
             res
@@ -55,7 +55,11 @@ impl WritableTimePartition {
             value: self.values_mmap.align_to_mut(self.len),
         }
     }
+    pub fn pct_full(&self) -> f32 {
+        self.len as f32 / self.timestamps_mmap.cap as f32
+    }
 }
+
 pub async fn write_stream(
     partition: Arc<RwLock<WritableTimePartition>>,
     mut stream: StreamPointVec,

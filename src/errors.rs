@@ -38,4 +38,8 @@ pub enum StorageConfigError {
         "WRITABLE_PARTITION_IDEAL_PCT_FULL must be <= {MAX_WRITABLE_PARTITION_IDEAL_PCT_FULL}"
     )]
     ToHighWritablePartitionIdealPctFull,
+    #[error("WRITABLE_PARTITION_DURATION_S must be >= {MIN_WRITABLE_PARTITION_DURATION_S}")]
+    ToLowWritablePartitionDuration,
+    #[error("WRITABLE_PARTITION_DURATION_S must be <= {MAX_WRITABLE_PARTITION_DURATION_S}")]
+    ToHighWritablePartitionDuration,
 }

@@ -7,11 +7,12 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             compression_level: 8,
-            retention_period_s: 31536000,        //1y
+            retention_duration_s: 31536000,      //1y
             stream_cache_ttl_s: 900,             //15m
             writable_partition_size: 1296000000, // some made up sh*t
-            writable_partitions: 2,
-            data_frequency_s: 900, //15m
+            min_writable_partitions: 2,
+            data_frequency_s: 900,      //15m
+            writable_duration_s: 86400, //1d
             writable_partition_ideal_pct_full: 0.75,
             data_storage_dir: PathBuf::from("/var/lib/wolfeymetrics"),
         }
@@ -27,14 +28,14 @@ impl StorageConfig {
             return Err(StorageConfigError::ToHighCompressionLevel);
         }
 
-        if self.retention_period_s < MIN_RETENTION_PERIOD_S {
+        if self.retention_duration_s < MIN_RETENTION_PERIOD_S {
             return Err(StorageConfigError::ToLowRetentionPeriod);
         }
-        if self.retention_period_s > MAX_RETENTION_PERIOD_S {
+        if self.retention_duration_s > MAX_RETENTION_PERIOD_S {
             return Err(StorageConfigError::ToHighRetentionPeriod);
         }
 
-        if self.writable_partitions < MIN_WRITEABLE_PARTITIONS {
+        if self.min_writable_partitions < MIN_WRITEABLE_PARTITIONS {
             return Err(StorageConfigError::ToLowWritablePartitions);
         }
 
@@ -53,7 +54,12 @@ impl StorageConfig {
         if self.writable_partition_ideal_pct_full > MAX_WRITABLE_PARTITION_IDEAL_PCT_FULL {
             return Err(StorageConfigError::ToHighWritablePartitionSize);
         }
-
+        if self.writable_duration_s < MIN_WRITABLE_PARTITION_DURATION_S {
+            return Err(StorageConfigError::ToLowWritablePartitionDuration);
+        }
+        if self.writable_duration_s > MAX_WRITABLE_PARTITION_DURATION_S {
+            return Err(StorageConfigError::ToHighWritablePartitionDuration);
+        }
         Ok(self)
     }
 }

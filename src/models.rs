@@ -48,12 +48,13 @@ pub struct Datapoint {
 pub struct StorageConfig {
     pub data_storage_dir: PathBuf,
     pub compression_level: usize,
-    pub retention_period_s: usize,
-    pub stream_cache_ttl_s: usize,
-    pub data_frequency_s: usize,
+    pub retention_duration_s: u64,
+    pub stream_cache_ttl_s: u64,
+    pub data_frequency_s: u64,
     pub writable_partition_size: usize,
     pub writable_partition_ideal_pct_full: f32,
-    pub writable_partitions: usize,
+    pub writable_duration_s: u64,
+    pub min_writable_partitions: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]

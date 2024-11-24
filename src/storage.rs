@@ -289,11 +289,33 @@ impl Storage {
         last_readable_writable_partition.pct_full() > self.config.writable_partition_ideal_pct_full
     }
 
+    async fn need_to_move_earliest_writable_to_readonly_partition(&self) -> bool {
+        let readable_writable_partitions = self.writable_partitions.read().await;
+        if readable_writable_partitions.len() <= self.config.min_writable_partitions {
+            return false;
+        }
+        let first_readable_writable_partition =
+            readable_writable_partitions.first().unwrap().read().await;
+
+        let now = Utc::now().timestamp();
+        let age = (now - first_readable_writable_partition.start_unix_s).unsigned_abs();
+
+        age > self.config.writable_duration_s
+    }
+
     pub async fn import_streams(&self, stream: ImportStream) -> Result<(), io::Error> {
         self.write_streams(stream).await;
 
         if self.need_new_writable_partition().await {
             self.start_next_stream().await?;
+        }
+
+        if self
+            .need_to_move_earliest_writable_to_readonly_partition()
+            .await
+        {
+
+            //TODO move earliest writable partition to readable partition
         }
 
         Ok(())

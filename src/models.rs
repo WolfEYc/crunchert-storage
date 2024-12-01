@@ -2,9 +2,9 @@ use dashmap::DashMap;
 use memmap2::{Mmap, MmapMut};
 use serde::{Deserialize, Serialize};
 use soa_derive::StructOfArray;
+use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::{fs::File, marker::PhantomData};
 use tokio::sync::{Mutex, RwLock};
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -51,7 +51,7 @@ pub struct StorageConfig {
     pub retention_duration_s: u64,
     pub stream_cache_ttl_s: u64,
     pub data_frequency_s: u64,
-    pub writable_partition_size: usize,
+    pub writable_partition_bytes: usize,
     pub writable_partition_ideal_pct_full: f32,
     pub writable_duration_s: u64,
     pub min_writable_partitions: usize,
@@ -104,12 +104,13 @@ pub struct ReadOnlyStream {
 pub struct ReadOnlyTimePartition {
     pub start_unix_s: i64,
     pub mmap: Mmap,
+    pub file: tokio::fs::File,
     pub streams: DashMap<u64, ReadOnlyStream>,
 }
 
 pub struct ResizableMmapMut<T> {
     pub mmap: MmapMut,
-    pub file: File,
+    pub file: tokio::fs::File,
     pub cap: usize,
     pub item: PhantomData<T>,
 }

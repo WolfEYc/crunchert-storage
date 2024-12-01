@@ -1,6 +1,12 @@
+use dashmap::DashMap;
 use itertools::Itertools;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use memmap2::MmapMut;
+use pco::standalone::simpler_compress;
+use std::{collections::HashMap, fs, io, sync::Arc};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{Mutex, RwLock},
+};
 
 use crate::models::*;
 
@@ -66,6 +72,72 @@ impl WritableTimePartition {
     #[inline]
     pub fn pct_full(&self) -> f32 {
         self.len as f32 / self.timestamps_mmap.cap as f32
+    }
+    pub async fn freeze(
+        &self,
+        config: &StorageConfig,
+    ) -> Result<ReadOnlyTimePartitionFileHeader, io::Error> {
+        let mut compressed_pts = Vec::new();
+        let mut disk_streams = Vec::new();
+        {
+            let mut by_stream_id = HashMap::<u64, HotStream>::new();
+            for x in self.stream() {
+                by_stream_id
+                    .entry(*x.stream_id)
+                    .and_modify(|hs| {
+                        hs.unix_seconds.push(*x.timestamp);
+                        hs.values.push(*x.value);
+                    })
+                    .or_insert_with(|| HotStream {
+                        unix_seconds: vec![*x.timestamp],
+                        values: vec![*x.value],
+                    });
+            }
+
+            for (stream_id, hs) in by_stream_id {
+                let unix_s_byte_start = compressed_pts.len();
+                {
+                    let compressed_timestamps =
+                        simpler_compress(&hs.unix_seconds, config.compression_level).unwrap();
+                    compressed_pts.extend_from_slice(&compressed_timestamps);
+                }
+                let unix_s_byte_stop = compressed_pts.len();
+                {
+                    let compressed_values =
+                        simpler_compress(&hs.values, config.compression_level).unwrap();
+                    compressed_pts.extend_from_slice(&compressed_values);
+                }
+                let values_byte_stop = compressed_pts.len();
+                disk_streams.push(ReadOnlyDiskStreamFileHeader {
+                    stream_id,
+                    unix_s_byte_start,
+                    unix_s_byte_stop,
+                    values_byte_stop,
+                })
+            }
+        }
+
+        let file_path = config
+            .data_storage_dir
+            .join(self.start_unix_s.to_string())
+            .join("_readonly");
+        {
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .open(&file_path)
+                .await?;
+
+            file.write_all(&compressed_pts).await?;
+            file.flush().await?;
+        }
+        let file_header = ReadOnlyTimePartitionFileHeader {
+            start_unix_s: self.start_unix_s,
+            file_path,
+            disk_streams,
+        };
+
+        Ok(file_header)
     }
 }
 

@@ -7,9 +7,9 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             compression_level: 8,
-            retention_duration_s: 31536000,      //1y
-            stream_cache_ttl_s: 900,             //15m
-            writable_partition_size: 1296000000, // some made up sh*t
+            retention_duration_s: 31536000,       //1y
+            stream_cache_ttl_s: 900,              //15m
+            writable_partition_bytes: 1296000000, // 1.2 GB, this needs to fit in memory!
             min_writable_partitions: 2,
             data_frequency_s: 900,      //15m
             writable_duration_s: 86400, //1d
@@ -39,10 +39,10 @@ impl StorageConfig {
             return Err(StorageConfigError::ToLowWritablePartitions);
         }
 
-        if self.writable_partition_size < MIN_WRITEABLE_PARTITION_SIZE {
+        if self.writable_partition_bytes < MIN_WRITEABLE_PARTITION_SIZE {
             return Err(StorageConfigError::ToLowWritablePartitionSize);
         }
-        if self.writable_partition_size > MAX_WRITEABLE_PARTITION_SIZE {
+        if self.writable_partition_bytes > MAX_WRITEABLE_PARTITION_SIZE {
             return Err(StorageConfigError::ToHighWritablePartitionSize);
         }
         if self.data_frequency_s > MAX_DATA_FREQUENCY_S {

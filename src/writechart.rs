@@ -55,6 +55,15 @@ impl WritableTimePartition {
             value: self.values_mmap.align_to_mut(self.len),
         }
     }
+    #[inline]
+    pub fn cap(&self) -> usize {
+        self.timestamps_mmap.cap
+    }
+    #[inline]
+    pub fn pts_free(&self) -> usize {
+        self.cap() - self.len
+    }
+    #[inline]
     pub fn pct_full(&self) -> f32 {
         self.len as f32 / self.timestamps_mmap.cap as f32
     }
@@ -101,6 +110,9 @@ pub async fn write_stream(
 
     {
         let mut writable_partition = partition.write().await;
+        if stream.len() > writable_partition.pts_free() {
+            return;
+        }
         let r_offset_count = writable_partition.len - last_idx - 1;
         let prev_len = writable_partition.len;
         writable_partition.len += stream.len();

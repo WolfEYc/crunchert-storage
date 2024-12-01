@@ -246,7 +246,7 @@ impl Storage {
         assert!(writable_partitions.len() != 0);
 
         let mut import_joinset = JoinSet::new();
-        for partition in writable_partitions.iter().cloned().rev() {
+        for partition in writable_partitions.iter().rev() {
             let start_unix_s = partition.read().await.start_unix_s;
 
             let start_idx = stream
@@ -260,7 +260,7 @@ impl Storage {
             }
 
             let stream_pts = stream.pts.split_off(start_idx);
-            import_joinset.spawn(write_stream(partition, stream_pts));
+            import_joinset.spawn(write_stream(partition.clone(), stream_pts));
             if stream.pts.is_empty() {
                 break;
             }

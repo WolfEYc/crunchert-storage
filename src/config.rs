@@ -62,4 +62,7 @@ impl StorageConfig {
         }
         Ok(self)
     }
+    pub fn partitions_file_path(&self) -> PathBuf {
+        self.data_storage_dir.join(PARTITIONS_FILE_HEADER_FILENAME)
+    }
 }

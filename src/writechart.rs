@@ -1,12 +1,7 @@
-use dashmap::DashMap;
 use itertools::Itertools;
-use memmap2::MmapMut;
 use pco::standalone::simpler_compress;
-use std::{collections::HashMap, fs, io, sync::Arc};
-use tokio::{
-    io::AsyncWriteExt,
-    sync::{Mutex, RwLock},
-};
+use std::{collections::HashMap, io, sync::Arc};
+use tokio::{io::AsyncWriteExt, sync::RwLock};
 
 use crate::models::*;
 

@@ -1,4 +1,3 @@
-use crate::constants::*;
 use crate::errors::*;
 use crate::models::*;
 use crate::readchart::writable_time_partition_get_agg_chart;
@@ -7,6 +6,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use itertools::Itertools;
 use memmap2::{Mmap, MmapMut};
+use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -109,9 +109,14 @@ impl PartitionsFileHeader {
         }
     }
 
-    fn from_file(path: &Path) -> Result<Self, StorageCreationError> {
-        let bytes = std::fs::read(path)?;
-        Ok(postcard::from_bytes(&bytes)?)
+    async fn from_file(path: &Path) -> Result<Self, io::Error> {
+        let bytes = tokio::fs::read(path).await?;
+        Ok(postcard::from_bytes(&bytes).unwrap())
+    }
+    async fn to_file(&self, path: &Path) -> Result<(), io::Error> {
+        let bytes = postcard::to_allocvec(self).unwrap();
+        tokio::fs::write(path, bytes).await?;
+        Ok(())
     }
 
     async fn thaw(
@@ -119,7 +124,7 @@ impl PartitionsFileHeader {
     ) -> Result<
         (
             Vec<Arc<ReadOnlyTimePartition>>,
-            Vec<Arc<RwLock<WritableTimePartition>>>,
+            VecDeque<Arc<RwLock<WritableTimePartition>>>,
         ),
         io::Error,
     > {
@@ -232,12 +237,9 @@ impl Storage {
         num_threads: usize,
     ) -> Result<Self, StorageCreationError> {
         let config = config.validate()?;
-        let partitions_file_path = config
-            .data_storage_dir
-            .join(PARTITIONS_FILE_HEADER_FILENAME);
-
+        let partitions_file_path = config.partitions_file_path();
         let partitions_file_header = if partitions_file_path.exists() {
-            PartitionsFileHeader::from_file(&partitions_file_path)?
+            PartitionsFileHeader::from_file(&partitions_file_path).await?
         } else {
             PartitionsFileHeader::new(&config)
         };
@@ -300,14 +302,14 @@ impl Storage {
         }
         {
             let mut writable_writable_partitions = self.writable_partitions.write().await;
-            writable_writable_partitions.push(Arc::new(RwLock::new(writable_partition)));
+            writable_writable_partitions.push_back(Arc::new(RwLock::new(writable_partition)));
         }
         Ok(())
     }
     async fn need_new_writable_partition(&self) -> bool {
         let readable_writable_partitions = self.writable_partitions.read().await;
         let last_readable_writable_partition =
-            readable_writable_partitions.last().unwrap().read().await;
+            readable_writable_partitions.back().unwrap().read().await;
         last_readable_writable_partition.pct_full() > self.config.writable_partition_ideal_pct_full
     }
 
@@ -317,12 +319,46 @@ impl Storage {
             return false;
         }
         let first_readable_writable_partition =
-            readable_writable_partitions.first().unwrap().read().await;
+            readable_writable_partitions.front().unwrap().read().await;
 
         let now = Utc::now().timestamp();
         let age = (now - first_readable_writable_partition.start_unix_s).unsigned_abs();
 
         age > self.config.writable_duration_s
+    }
+
+    async fn freeze_oldest_writable(&self) -> Result<(), io::Error> {
+        let first_writable_partition_read_guard = {
+            let mut writable_writable_partitions = self.writable_partitions.write().await;
+            writable_writable_partitions.pop_front().unwrap()
+        };
+        let frozen_partition = {
+            let first_writable_partition = first_writable_partition_read_guard.read().await;
+            first_writable_partition.freeze(&self.config).await?
+        };
+        {
+            let readable_frozen_partition_job = frozen_partition.clone().materialize();
+            let wrtiable_readonly_partitions_job = self.readonly_partitions.write();
+            let (readable_frozen_partition, mut writable_readonly_partitions) = tokio::join!(
+                readable_frozen_partition_job,
+                wrtiable_readonly_partitions_job
+            );
+            writable_readonly_partitions.push(Arc::new(readable_frozen_partition?));
+        }
+        {
+            let mut writable_partitions_file_header = self.partitions_file_header.write().await;
+            writable_partitions_file_header
+                .read_only_time_partitions
+                .push(frozen_partition);
+            writable_partitions_file_header
+                .writable_time_partitions
+                .remove(0);
+
+            writable_partitions_file_header
+                .to_file(&self.config.partitions_file_path())
+                .await?;
+        }
+        Ok(())
     }
 
     pub async fn import_streams(&self, stream: ImportStream) -> Result<(), io::Error> {
@@ -333,8 +369,7 @@ impl Storage {
         }
 
         if self.writable_freeze_required().await {
-
-            //TODO move earliest writable partition to readable partition
+            self.freeze_oldest_writable().await?;
         }
 
         Ok(())

@@ -2,9 +2,9 @@ use dashmap::DashMap;
 use memmap2::{Mmap, MmapMut};
 use serde::{Deserialize, Serialize};
 use soa_derive::StructOfArray;
-use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::{collections::VecDeque, marker::PhantomData};
 use tokio::sync::{Mutex, RwLock};
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -128,7 +128,7 @@ pub struct Storage {
     pub config: StorageConfig,
     pub partitions_file_header: RwLock<PartitionsFileHeader>,
     pub readonly_partitions: RwLock<Vec<Arc<ReadOnlyTimePartition>>>,
-    pub writable_partitions: RwLock<Vec<Arc<RwLock<WritableTimePartition>>>>,
+    pub writable_partitions: RwLock<VecDeque<Arc<RwLock<WritableTimePartition>>>>,
     pub num_threads: usize,
 }
 

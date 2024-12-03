@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use memmap2::{Mmap, MmapMut};
 use serde::{Deserialize, Serialize};
 use soa_derive::StructOfArray;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::{collections::VecDeque, marker::PhantomData};
@@ -38,7 +39,7 @@ pub struct ChartRequest {
     pub step_s: u32,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, StructOfArray)]
 pub struct Datapoint {
     pub unix_s: i64,
     pub value: f32,
@@ -89,15 +90,9 @@ pub struct PartitionsFileHeader {
     pub writable_time_partitions: Vec<WritableTimePartitionFileHeader>,
 }
 
-#[derive(Default)]
-pub struct HotStream {
-    pub unix_seconds: Vec<i64>,
-    pub values: Vec<f32>,
-}
-
 pub struct ReadOnlyStream {
     pub disk_header: ReadOnlyDiskStreamFileHeader,
-    pub hot_stream: RwLock<Option<HotStream>>,
+    pub hot_stream: RwLock<Option<DatapointVec>>,
     pub last_accessed: Mutex<Option<i64>>,
 }
 
@@ -115,13 +110,18 @@ pub struct ResizableMmapMut<T> {
     pub item: PhantomData<T>,
 }
 
+pub struct WritableStreamCache {
+    pub hs: RwLock<Option<DatapointVec>>,
+    pub count: usize,
+}
+
 pub struct WritableTimePartition {
     pub len: usize,
     pub start_unix_s: i64,
     pub timestamps_mmap: ResizableMmapMut<i64>,
     pub streams_mmap: ResizableMmapMut<u64>,
     pub values_mmap: ResizableMmapMut<f32>,
-    pub streams: DashMap<u64, RwLock<HotStream>>,
+    pub streams: HashMap<u64, WritableStreamCache>,
 }
 
 pub struct Storage {

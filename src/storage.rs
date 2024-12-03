@@ -6,6 +6,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use itertools::Itertools;
 use memmap2::{Mmap, MmapMut};
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
@@ -89,7 +90,7 @@ impl WritableTimePartitionFileHeader {
             tokio::join!(timestamps_mmap_job, streams_mmap_job, values_mmap_job);
 
         let start_unix_s = self.start_unix_s;
-        let streams = DashMap::new();
+        let streams = HashMap::new();
 
         Ok(WritableTimePartition {
             start_unix_s,

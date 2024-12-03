@@ -74,15 +74,23 @@ impl Aggregation {
     }
 }
 
-impl HotStream {
+impl DatapointVec {
     fn get_chart_values(&self, req: ChartReqMetadata) -> impl Iterator<Item = Option<f32>> + '_ {
+        let mut prev_index = 0;
+        let max_idx = self
+            .unix_s
+            .binary_search(&req.stop_unix_s)
+            .map_or_else(|e| e, |x| x + 1);
         req.iter_search_ts().map(move |x| {
-            let found_ts_idx = self.unix_seconds.binary_search(&x).unwrap_or_else(|x| x);
-            let found_ts_idx = min(found_ts_idx, self.unix_seconds.len() - 1);
-            let found_ts = self.unix_seconds[found_ts_idx];
+            let found_ts_idx = self.unix_s[prev_index..max_idx]
+                .binary_search(&x)
+                .unwrap_or_else(|x| x);
+            let found_ts_idx = min(found_ts_idx, self.unix_s.len() - 1);
+            let found_ts = self.unix_s[found_ts_idx];
             let diff = x.abs_diff(found_ts);
+            prev_index = found_ts_idx;
             if diff < req.step_s as u64 {
-                let value = self.values[found_ts_idx];
+                let value = self.value[found_ts_idx];
                 Some(value)
             } else {
                 None
@@ -120,20 +128,20 @@ impl From<&ChartRequest> for ChartReqMetadata {
 }
 
 impl ReadOnlyDiskStreamFileHeader {
-    fn read_stream_from_compressed(&self, mmap: &Mmap) -> HotStream {
+    fn read_stream_from_compressed(&self, mmap: &Mmap) -> DatapointVec {
         let unix_s_bytes = &mmap[self.unix_s_byte_start..self.unix_s_byte_stop];
         let value_bytes = &mmap[self.unix_s_byte_stop..self.values_byte_stop];
 
         let Ok(unix_s_decompressed) = simple_decompress(unix_s_bytes) else {
-            return HotStream::default();
+            return DatapointVec::default();
         };
         let Ok(values_decompressed) = simple_decompress(value_bytes) else {
-            return HotStream::default();
+            return DatapointVec::default();
         };
 
-        HotStream {
-            unix_seconds: unix_s_decompressed,
-            values: values_decompressed,
+        DatapointVec {
+            unix_s: unix_s_decompressed,
+            value: values_decompressed,
         }
     }
 }
@@ -248,10 +256,43 @@ impl ReadOnlyTimePartition {
             .collect()
     }
 }
-
+impl<T> ResizableMmapMut<T> {
+    fn align_to(&self, len: usize) -> &[T] {
+        unsafe {
+            let (_, res, _) = self.mmap[..len].align_to();
+            res
+        }
+    }
+}
 impl WritableTimePartition {
-    fn get_stream_from_wal(&self, stream_id: u64, meta: ChartReqMetadata) -> Option<HotStream> {
-        todo!()
+    #[inline]
+    pub fn cap(&self) -> usize {
+        self.timestamps_mmap.cap
+    }
+    #[inline]
+    pub fn pts_free(&self) -> usize {
+        self.cap() - self.len
+    }
+    #[inline]
+    pub fn pct_full(&self) -> f32 {
+        self.len as f32 / self.timestamps_mmap.cap as f32
+    }
+    pub fn stream(&self) -> StreamPointSlice {
+        StreamPointSlice {
+            timestamp: self.timestamps_mmap.align_to(self.len),
+            stream_id: self.streams_mmap.align_to(self.len),
+            value: self.values_mmap.align_to(self.len),
+        }
+    }
+    pub fn get_stream_from_wal(&self, stream_id: u64) -> DatapointVec {
+        self.stream()
+            .iter()
+            .filter(|x| *x.stream_id == stream_id)
+            .map(|x| Datapoint {
+                unix_s: *x.timestamp,
+                value: *x.value,
+            })
+            .collect()
     }
 }
 pub async fn writable_get_chart_aggregated_batched(
@@ -271,25 +312,22 @@ pub async fn writable_get_chart_aggregated_batched(
     };
     // pretty confident with this math, if it goes wrong, then well shit
 
-    let read_lock = writable_partition.read().await;
-    let streams = req.stream_ids[start_idx..stop_idx].iter().filter_map(|x| {
-        let from_cache = read_lock.streams.get(x);
-        if from_cache.is_some() {
-            return from_cache;
-        }
-        let Some(stream_from_wal) = read_lock.get_stream_from_wal(*x, meta) else {
-            return None;
-        };
-
-        let locked_stream = RwLock::new(stream_from_wal);
-        read_lock.streams.insert(*x, locked_stream);
-        read_lock.streams.get(x)
-    });
+    let partition_read_lock = writable_partition.read().await;
 
     let mut aggregated_batch = vec![ValueTracker::default(); meta.resolution];
-    for stream in streams {
-        let readable_stream = stream.read().await;
-        aggregated_batch = readable_stream.add_stream_to_chart(meta, aggregated_batch, agg);
+    for stream_id in &req.stream_ids[start_idx..stop_idx] {
+        let Some(from_cache) = partition_read_lock.streams.get(stream_id) else {
+            continue;
+        };
+
+        if let Some(ref hs) = *from_cache.hs.read().await {
+            aggregated_batch = hs.add_stream_to_chart(meta, aggregated_batch, agg);
+            continue;
+        }
+        let hs = partition_read_lock.get_stream_from_wal(*stream_id);
+        aggregated_batch = hs.add_stream_to_chart(meta, aggregated_batch, agg);
+        let mut writetable_hs = from_cache.hs.write().await;
+        *writetable_hs = Some(hs)
     }
     return aggregated_batch;
 }

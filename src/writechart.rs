@@ -1,6 +1,6 @@
 use itertools::Itertools;
 use pco::standalone::simpler_compress;
-use std::{collections::HashMap, io, sync::Arc};
+use std::{io, sync::Arc};
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 
 use crate::models::*;
@@ -27,12 +27,6 @@ impl PartialOrd for StreamPoint {
 }
 
 impl<T> ResizableMmapMut<T> {
-    fn align_to(&self, len: usize) -> &[T] {
-        unsafe {
-            let (_, res, _) = self.mmap[..len].align_to();
-            res
-        }
-    }
     fn align_to_mut(&mut self, len: usize) -> &mut [T] {
         unsafe {
             let (_, res, _) = self.mmap[..len].align_to_mut();
@@ -42,13 +36,6 @@ impl<T> ResizableMmapMut<T> {
 }
 
 impl WritableTimePartition {
-    fn stream(&self) -> StreamPointSlice {
-        StreamPointSlice {
-            timestamp: self.timestamps_mmap.align_to(self.len),
-            stream_id: self.streams_mmap.align_to(self.len),
-            value: self.values_mmap.align_to(self.len),
-        }
-    }
     fn stream_mut(&mut self) -> StreamPointSliceMut {
         StreamPointSliceMut {
             timestamp: self.timestamps_mmap.align_to_mut(self.len),
@@ -56,60 +43,39 @@ impl WritableTimePartition {
             value: self.values_mmap.align_to_mut(self.len),
         }
     }
-    #[inline]
-    pub fn cap(&self) -> usize {
-        self.timestamps_mmap.cap
-    }
-    #[inline]
-    pub fn pts_free(&self) -> usize {
-        self.cap() - self.len
-    }
-    #[inline]
-    pub fn pct_full(&self) -> f32 {
-        self.len as f32 / self.timestamps_mmap.cap as f32
-    }
     pub async fn freeze(
         &self,
         config: &StorageConfig,
     ) -> Result<ReadOnlyTimePartitionFileHeader, io::Error> {
         let mut compressed_pts = Vec::new();
         let mut disk_streams = Vec::new();
-        {
-            let mut by_stream_id = HashMap::<u64, HotStream>::new();
-            for x in self.stream() {
-                by_stream_id
-                    .entry(*x.stream_id)
-                    .and_modify(|hs| {
-                        hs.unix_seconds.push(*x.timestamp);
-                        hs.values.push(*x.value);
-                    })
-                    .or_insert_with(|| HotStream {
-                        unix_seconds: vec![*x.timestamp],
-                        values: vec![*x.value],
-                    });
-            }
-
-            for (stream_id, hs) in by_stream_id {
-                let unix_s_byte_start = compressed_pts.len();
-                {
-                    let compressed_timestamps =
-                        simpler_compress(&hs.unix_seconds, config.compression_level).unwrap();
-                    compressed_pts.extend_from_slice(&compressed_timestamps);
+        for (&stream_id, cache) in &self.streams {
+            let readlock = cache.hs.read().await;
+            let hs = {
+                match *readlock {
+                    Some(ref hs) => hs,
+                    None => &self.get_stream_from_wal(stream_id),
                 }
-                let unix_s_byte_stop = compressed_pts.len();
-                {
-                    let compressed_values =
-                        simpler_compress(&hs.values, config.compression_level).unwrap();
-                    compressed_pts.extend_from_slice(&compressed_values);
-                }
-                let values_byte_stop = compressed_pts.len();
-                disk_streams.push(ReadOnlyDiskStreamFileHeader {
-                    stream_id,
-                    unix_s_byte_start,
-                    unix_s_byte_stop,
-                    values_byte_stop,
-                })
+            };
+            let unix_s_byte_start = compressed_pts.len();
+            {
+                let compressed_timestamps =
+                    simpler_compress(&hs.unix_s, config.compression_level).unwrap();
+                compressed_pts.extend_from_slice(&compressed_timestamps);
             }
+            let unix_s_byte_stop = compressed_pts.len();
+            {
+                let compressed_values =
+                    simpler_compress(&hs.value, config.compression_level).unwrap();
+                compressed_pts.extend_from_slice(&compressed_values);
+            }
+            let values_byte_stop = compressed_pts.len();
+            disk_streams.push(ReadOnlyDiskStreamFileHeader {
+                stream_id,
+                unix_s_byte_start,
+                unix_s_byte_stop,
+                values_byte_stop,
+            })
         }
 
         let file_path = config

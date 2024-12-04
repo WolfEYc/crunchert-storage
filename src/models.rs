@@ -1,4 +1,3 @@
-use dashmap::DashMap;
 use memmap2::{Mmap, MmapMut};
 use serde::{Deserialize, Serialize};
 use soa_derive::StructOfArray;
@@ -6,7 +5,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::{collections::VecDeque, marker::PhantomData};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
 #[derive(Default, Debug, Clone, Copy)]
 pub struct ValueTracker {
@@ -32,6 +31,7 @@ pub enum Aggregation {
     Max,
 }
 
+#[derive(Clone)]
 pub struct ChartRequest {
     pub stream_ids: Vec<u64>,
     pub start_unix_s: i64,
@@ -90,17 +90,11 @@ pub struct PartitionsFileHeader {
     pub writable_time_partitions: Vec<WritableTimePartitionFileHeader>,
 }
 
-pub struct ReadOnlyStream {
-    pub disk_header: ReadOnlyDiskStreamFileHeader,
-    pub hot_stream: RwLock<Option<DatapointVec>>,
-    pub last_accessed: Mutex<Option<i64>>,
-}
-
 pub struct ReadOnlyTimePartition {
     pub start_unix_s: i64,
     pub mmap: Mmap,
     pub file: tokio::fs::File,
-    pub streams: DashMap<u64, ReadOnlyStream>,
+    pub streams: HashMap<u64, ReadOnlyDiskStreamFileHeader>,
 }
 
 pub struct ResizableMmapMut<T> {
@@ -121,7 +115,6 @@ pub struct WritableTimePartition {
     pub timestamps_mmap: ResizableMmapMut<i64>,
     pub streams_mmap: ResizableMmapMut<u64>,
     pub values_mmap: ResizableMmapMut<f32>,
-    pub streams: HashMap<u64, WritableStreamCache>,
 }
 
 pub struct Storage {
@@ -130,12 +123,4 @@ pub struct Storage {
     pub readonly_partitions: RwLock<Vec<Arc<ReadOnlyTimePartition>>>,
     pub writable_partitions: RwLock<VecDeque<Arc<RwLock<WritableTimePartition>>>>,
     pub num_threads: usize,
-}
-
-#[derive(Clone, Copy)]
-pub struct ChartReqMetadata {
-    pub start_unix_s: i64,
-    pub stop_unix_s: i64,
-    pub step_s: u32,
-    pub resolution: usize,
 }

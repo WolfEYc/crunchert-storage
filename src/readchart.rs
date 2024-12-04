@@ -1,12 +1,9 @@
-use crate::constants::*;
 use crate::models::*;
-use chrono::Utc;
 use memmap2::Mmap;
 use pco::standalone::simple_decompress;
-use std::cmp::{max, min};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::task::JoinSet;
 
 impl ChartRequest {
     fn resolution(&self) -> usize {
@@ -14,9 +11,6 @@ impl ChartRequest {
         let resolution = duration_s / self.step_s;
         return resolution as usize;
     }
-}
-
-impl ChartReqMetadata {
     #[inline]
     fn iter_search_ts(&self) -> impl Iterator<Item = i64> {
         (self.start_unix_s..self.stop_unix_s)
@@ -74,59 +68,6 @@ impl Aggregation {
     }
 }
 
-impl DatapointVec {
-    fn get_chart_values(&self, req: ChartReqMetadata) -> impl Iterator<Item = Option<f32>> + '_ {
-        let mut prev_index = 0;
-        let max_idx = self
-            .unix_s
-            .binary_search(&req.stop_unix_s)
-            .map_or_else(|e| e, |x| x + 1);
-        req.iter_search_ts().map(move |x| {
-            let found_ts_idx = self.unix_s[prev_index..max_idx]
-                .binary_search(&x)
-                .unwrap_or_else(|x| x);
-            let found_ts_idx = min(found_ts_idx, self.unix_s.len() - 1);
-            let found_ts = self.unix_s[found_ts_idx];
-            let diff = x.abs_diff(found_ts);
-            prev_index = found_ts_idx;
-            if diff < req.step_s as u64 {
-                let value = self.value[found_ts_idx];
-                Some(value)
-            } else {
-                None
-            }
-        })
-    }
-    fn add_stream_to_chart(
-        &self,
-        req: ChartReqMetadata,
-        aggregated_result: Vec<ValueTracker>,
-        agg: Aggregation,
-    ) -> Vec<ValueTracker> {
-        let chart_values = self.get_chart_values(req);
-        let agg_fn = agg.to_agg_fn();
-        aggregated_result
-            .into_iter()
-            .zip(chart_values)
-            .filter_map(|(x, y)| match y {
-                Some(y) => Some((x, y)),
-                None => None,
-            })
-            .map(|(x, y)| x.apply(y, &agg_fn))
-            .collect()
-    }
-}
-impl From<&ChartRequest> for ChartReqMetadata {
-    fn from(value: &ChartRequest) -> Self {
-        Self {
-            start_unix_s: value.start_unix_s,
-            stop_unix_s: value.stop_unix_s,
-            step_s: value.step_s,
-            resolution: value.resolution(),
-        }
-    }
-}
-
 impl ReadOnlyDiskStreamFileHeader {
     fn read_stream_from_compressed(&self, mmap: &Mmap) -> DatapointVec {
         let unix_s_bytes = &mmap[self.unix_s_byte_start..self.unix_s_byte_stop];
@@ -145,117 +86,24 @@ impl ReadOnlyDiskStreamFileHeader {
         }
     }
 }
-impl ReadOnlyStream {
-    async fn get_chart_aggregated(
-        &self,
-        req: ChartReqMetadata,
-        mmap: &Mmap,
-        aggregated_result: Vec<ValueTracker>,
-        agg: Aggregation,
-    ) -> Vec<ValueTracker> {
-        {
-            let mut last_accessed_lock = self.last_accessed.lock().await;
-            *last_accessed_lock = Some(Utc::now().timestamp());
-        }
-        {
-            let hot_stream_option = self.hot_stream.read().await;
-            if let Some(ref x) = *hot_stream_option {
-                return x.add_stream_to_chart(req, aggregated_result, agg);
-            }
-        }
-
-        let mut writable_hot_stream = self.hot_stream.write().await;
-
-        if let Some(ref x) = *writable_hot_stream {
-            return x.add_stream_to_chart(req, aggregated_result, agg);
-        }
-
-        let hot_stream = self.disk_header.read_stream_from_compressed(mmap);
-
-        let res = hot_stream.add_stream_to_chart(req, aggregated_result, agg);
-        *writable_hot_stream = Some(hot_stream);
-        res
-    }
-}
 
 impl ReadOnlyTimePartition {
-    async fn read_only_get_chart_aggregated_batched(
+    pub async fn get_chart_aggregated(
         self: Arc<Self>,
-        req: Arc<ChartRequest>,
+        req: ChartRequest,
         agg: Aggregation,
-        meta: ChartReqMetadata,
-        thread_idx: usize,
-        num_threads: usize,
-    ) -> Vec<ValueTracker> {
-        let streams_per_thread = req.stream_ids.len() / num_threads;
-        let start_idx = streams_per_thread * thread_idx;
-        let stop_idx = if thread_idx == num_threads - 1 {
-            req.stream_ids.len()
-        } else {
-            streams_per_thread * (thread_idx + 1)
-        };
-        // pretty confident with this math, if it goes wrong, then well shit
-
-        let streams = req.stream_ids[start_idx..stop_idx]
+    ) -> DatapointVec {
+        let datapoint_vecs = req
+            .stream_ids
             .iter()
-            .filter_map(|x| self.streams.get(x));
+            .filter_map(|x| self.streams.get(x))
+            .map(|x| x.read_stream_from_compressed(&self.mmap));
 
-        let mut aggregated_batch = vec![ValueTracker::default(); meta.resolution];
-        for stream in streams {
-            aggregated_batch = stream
-                .get_chart_aggregated(meta, &self.mmap, aggregated_batch, agg)
-                .await;
-        }
-        return aggregated_batch;
-    }
-
-    pub async fn read_only_time_partition_get_agg_chart(
-        self: Arc<Self>,
-        req: Arc<ChartRequest>,
-        agg: Aggregation,
-        num_threads: usize,
-    ) -> Vec<Datapoint> {
-        let meta: ChartReqMetadata = req.as_ref().into();
-
-        let threads_requested = req.stream_ids.len() / MIN_STREAMS_PER_THREAD;
-        let threads_capped = min(threads_requested, num_threads);
-        let num_threads = max(threads_capped, 1);
-
-        let batches = (0..num_threads).map(|x| {
-            self.clone().read_only_get_chart_aggregated_batched(
-                req.clone(),
-                agg,
-                meta,
-                x,
-                num_threads,
-            )
-        });
-        let agg_fn = agg.to_agg_fn();
-        let batched_agg_chart = JoinSet::from_iter(batches).join_all().await;
-        let reduced = batched_agg_chart.into_iter().reduce(|acc, x| {
-            acc.into_iter()
-                .zip(x)
-                .map(|(x, y)| x.agg(y, &agg_fn))
-                .collect()
-        });
-
-        let Some(reduced) = reduced else {
-            panic!("tried to aggregate nothing");
-        };
-
-        let final_agg = agg.to_final_agg();
-
-        reduced
-            .into_iter()
-            .zip(meta.iter_search_ts())
-            .filter(|(x, _)| x.count > 0)
-            .map(|(x, ts)| Datapoint {
-                unix_s: ts,
-                value: final_agg(x),
-            })
-            .collect()
+        // aggregate them all!
+        todo!()
     }
 }
+
 impl<T> ResizableMmapMut<T> {
     fn align_to(&self, len: usize) -> &[T] {
         unsafe {
@@ -295,87 +143,60 @@ impl WritableTimePartition {
             .collect()
     }
 }
-pub async fn writable_get_chart_aggregated_batched(
-    writable_partition: Arc<RwLock<WritableTimePartition>>,
-    req: Arc<ChartRequest>,
-    agg: Aggregation,
-    meta: ChartReqMetadata,
-    thread_idx: usize,
-    num_threads: usize,
-) -> Vec<ValueTracker> {
-    let streams_per_thread = req.stream_ids.len() / num_threads;
-    let start_idx = streams_per_thread * thread_idx;
-    let stop_idx = if thread_idx == num_threads - 1 {
-        req.stream_ids.len()
-    } else {
-        streams_per_thread * (thread_idx + 1)
-    };
-    // pretty confident with this math, if it goes wrong, then well shit
-
-    let partition_read_lock = writable_partition.read().await;
-
-    let mut aggregated_batch = vec![ValueTracker::default(); meta.resolution];
-    for stream_id in &req.stream_ids[start_idx..stop_idx] {
-        let Some(from_cache) = partition_read_lock.streams.get(stream_id) else {
-            continue;
-        };
-
-        if let Some(ref hs) = *from_cache.hs.read().await {
-            aggregated_batch = hs.add_stream_to_chart(meta, aggregated_batch, agg);
-            continue;
-        }
-        let hs = partition_read_lock.get_stream_from_wal(*stream_id);
-        aggregated_batch = hs.add_stream_to_chart(meta, aggregated_batch, agg);
-        let mut writetable_hs = from_cache.hs.write().await;
-        *writetable_hs = Some(hs)
-    }
-    return aggregated_batch;
-}
-
-pub async fn writable_time_partition_get_agg_chart(
+pub async fn get_writable_chart_aggregated(
     time_partition: Arc<RwLock<WritableTimePartition>>,
-    req: Arc<ChartRequest>,
+    req: ChartRequest,
     agg: Aggregation,
-    num_threads: usize,
-) -> Vec<Datapoint> {
-    let meta: ChartReqMetadata = req.as_ref().into();
+) -> DatapointVec {
+    let mut stream_counter: HashMap<u64, Option<f32>> =
+        req.stream_ids.iter().map(|&x| (x, None)).collect();
 
-    let threads_requested = req.stream_ids.len() / MIN_STREAMS_PER_THREAD;
-    let threads_capped = min(threads_requested, num_threads);
-    let num_threads = max(threads_capped, 1);
+    let tp_readlock = time_partition.read().await;
 
-    let batches = (0..num_threads).map(|x| {
-        writable_get_chart_aggregated_batched(
-            time_partition.clone(),
-            req.clone(),
-            agg,
-            meta,
-            x,
-            num_threads,
-        )
-    });
-    let agg_fn = agg.to_agg_fn();
-    let batched_agg_chart = JoinSet::from_iter(batches).join_all().await;
-    let reduced = batched_agg_chart.into_iter().reduce(|acc, x| {
-        acc.into_iter()
-            .zip(x)
-            .map(|(x, y)| x.agg(y, &agg_fn))
-            .collect()
-    });
+    let stream = tp_readlock.stream();
+    let first_idx = stream.timestamp.partition_point(|&x| x < req.start_unix_s);
+    let mut last_idx = stream.len();
 
-    let Some(reduced) = reduced else {
-        panic!("tried to aggregate nothing");
-    };
+    req.iter_search_ts()
+        .filter_map(|unix_s| {
+            let start_idx =
+                stream.timestamp[first_idx..last_idx].partition_point(|&p| p < unix_s) + first_idx;
+            let offset_ts = unix_s + req.step_s as i64;
+            let stop_idx = stream.timestamp[start_idx..last_idx]
+                .partition_point(|&p| p < offset_ts)
+                + start_idx;
+            last_idx = start_idx;
 
-    let final_agg = agg.to_final_agg();
+            for (i, stream_id) in stream.stream_id[start_idx..stop_idx].iter().enumerate() {
+                match stream_counter.get_mut(stream_id) {
+                    None => continue,
+                    Some(Some(_)) => continue,
+                    Some(none_ref) => *none_ref = Some(stream.value[i + start_idx]),
+                }
+            }
+            let maybe_value = match agg {
+                Aggregation::Sum => stream_counter.values().cloned().sum(),
+                Aggregation::Avg => {
+                    let (sum, counter) = stream_counter
+                        .values()
+                        .filter_map(|&x| x)
+                        .fold((0_f32, 0), |(sum, count), x| (sum + x, count + 1));
+                    match counter {
+                        0 => None,
+                        len => Some(sum / len as f32),
+                    }
+                }
+                Aggregation::Min => stream_counter.values().filter_map(|&x| x).reduce(f32::min),
+                Aggregation::Max => stream_counter.values().filter_map(|&x| x).reduce(f32::max),
+            };
+            for v in stream_counter.values_mut() {
+                *v = None
+            }
 
-    reduced
-        .into_iter()
-        .zip(meta.iter_search_ts())
-        .filter(|(x, _)| x.count > 0)
-        .map(|(x, ts)| Datapoint {
-            unix_s: ts,
-            value: final_agg(x),
+            match maybe_value {
+                None => None,
+                Some(value) => Some(Datapoint { unix_s, value }),
+            }
         })
         .collect()
 }

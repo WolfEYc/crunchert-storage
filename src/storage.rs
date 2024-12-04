@@ -1,17 +1,15 @@
 use crate::errors::*;
 use crate::models::*;
-use crate::readchart::writable_time_partition_get_agg_chart;
+use crate::readchart::get_writable_chart_aggregated;
 use crate::writechart::write_stream;
 use chrono::Utc;
-use dashmap::DashMap;
 use itertools::Itertools;
 use memmap2::{Mmap, MmapMut};
-use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 
 impl<T> ResizableMmapMut<T> {
@@ -38,20 +36,14 @@ impl<T> ResizableMmapMut<T> {
 
 impl ReadOnlyTimePartitionFileHeader {
     async fn materialize(self) -> Result<ReadOnlyTimePartition, io::Error> {
-        let hash_map_iter = self.disk_streams.iter().cloned().map(|x| {
-            (
-                x.stream_id,
-                ReadOnlyStream {
-                    disk_header: x,
-                    hot_stream: RwLock::new(None),
-                    last_accessed: Mutex::new(None),
-                },
-            )
-        });
+        let streams = self
+            .disk_streams
+            .into_iter()
+            .map(|x| (x.stream_id, x))
+            .collect();
 
         let file = tokio::fs::File::open(&self.file_path).await?;
         let mmap = unsafe { Mmap::map(&file)? };
-        let streams = DashMap::from_iter(hash_map_iter);
         let start_unix_s = self.start_unix_s;
         Ok(ReadOnlyTimePartition {
             file,
@@ -90,14 +82,12 @@ impl WritableTimePartitionFileHeader {
             tokio::join!(timestamps_mmap_job, streams_mmap_job, values_mmap_job);
 
         let start_unix_s = self.start_unix_s;
-        let streams = HashMap::new();
 
         Ok(WritableTimePartition {
             start_unix_s,
             timestamps_mmap: timestamps_mmap?,
             streams_mmap: streams_mmap?,
             values_mmap: values_mmap?,
-            streams,
             len: self.len,
         })
     }
@@ -203,20 +193,19 @@ impl Storage {
         return partitions_in_range;
     }
 
-    pub async fn get_agg_chart(&self, req: ChartRequest, agg: Aggregation) -> Vec<Datapoint> {
+    pub async fn get_agg_chart(&self, req: ChartRequest, agg: Aggregation) -> DatapointVec {
         let read_only_time_partitions = self
             .get_read_only_partitions_in_range(req.start_unix_s, req.stop_unix_s)
             .await;
         let writable_time_partitions = self
             .get_writable_partitions_in_range(req.start_unix_s, req.stop_unix_s)
             .await;
-        let arc_req = Arc::new(req);
-        let read_only_datapoint_jobs = read_only_time_partitions.into_iter().map(|x| {
-            x.read_only_time_partition_get_agg_chart(arc_req.clone(), agg, self.num_threads)
-        });
-        let writable_datapoint_jobs = writable_time_partitions.into_iter().map(|x| {
-            writable_time_partition_get_agg_chart(x, arc_req.clone(), agg, self.num_threads)
-        });
+        let read_only_datapoint_jobs = read_only_time_partitions
+            .into_iter()
+            .map(|x| x.get_chart_aggregated(req.clone(), agg));
+        let writable_datapoint_jobs = writable_time_partitions
+            .into_iter()
+            .map(|x| get_writable_chart_aggregated(x, req.clone(), agg));
 
         let read_only_datapoints_nested = JoinSet::from_iter(read_only_datapoint_jobs).join_all();
         let writeable_datapoints_nested = JoinSet::from_iter(writable_datapoint_jobs).join_all();
@@ -225,12 +214,16 @@ impl Storage {
                 .join_all()
                 .await;
 
-        let datapoints_flattened = all_datapoints_nested
+        all_datapoints_nested
             .into_iter()
             .flatten()
-            .flatten()
-            .collect();
-        return datapoints_flattened;
+            .into_iter()
+            .reduce(|mut acc, e| {
+                acc.unix_s.extend_from_slice(&e.unix_s);
+                acc.value.extend_from_slice(&e.value);
+                acc
+            })
+            .unwrap_or(DatapointVec::default())
     }
 
     pub async fn new(

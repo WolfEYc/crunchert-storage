@@ -1,4 +1,5 @@
 use crate::models::*;
+use itertools::Itertools;
 use memmap2::Mmap;
 use pco::standalone::simple_decompress;
 use std::collections::HashMap;
@@ -38,20 +39,69 @@ impl ReadOnlyDiskStreamFileHeader {
     }
 }
 
+#[inline]
+fn idx_closematch(
+    mut idx: usize,
+    timestamps: &[i64],
+    requested_ts: i64,
+    allowed_offset: u32,
+) -> Option<usize> {
+    if idx == timestamps.len() {
+        idx -= 1
+    }
+    if requested_ts.abs_diff(timestamps[idx]) > allowed_offset as u64 {
+        None
+    } else {
+        Some(idx)
+    }
+}
+
 impl ReadOnlyTimePartition {
     pub async fn get_chart_aggregated(
         self: Arc<Self>,
         req: ChartRequest,
         agg: Aggregation,
     ) -> DatapointVec {
-        let datapoint_vecs = req
+        let datapoint_vecs: Vec<DatapointVec> = req
             .stream_ids
             .iter()
             .filter_map(|x| self.streams.get(x))
-            .map(|x| x.read_stream_from_compressed(&self.mmap));
+            .map(|x| x.read_stream_from_compressed(&self.mmap))
+            .collect();
 
-        // aggregate them all!
-        todo!()
+        req.iter_search_ts()
+            .filter_map(|unix_s| {
+                let values = datapoint_vecs.iter().filter_map(|pts| {
+                    let idx_res = pts.unix_s.binary_search(&unix_s);
+                    match idx_res {
+                        Ok(i) => Some(pts.value[i]),
+                        Err(i) => match idx_closematch(i, &pts.unix_s, unix_s, req.step_s) {
+                            None => None,
+                            Some(idx) => Some(pts.value[idx]),
+                        },
+                    }
+                });
+
+                let maybe_agged_value = match agg {
+                    Aggregation::Sum => values.sum1(),
+                    Aggregation::Avg => {
+                        let (sum, counter) =
+                            values.fold((0_f32, 0), |(sum, count), x| (sum + x, count + 1));
+                        match counter {
+                            0 => None,
+                            len => Some(sum / len as f32),
+                        }
+                    }
+                    Aggregation::Min => values.reduce(f32::min),
+                    Aggregation::Max => values.reduce(f32::max),
+                };
+
+                match maybe_agged_value {
+                    None => None,
+                    Some(value) => Some(Datapoint { unix_s, value }),
+                }
+            })
+            .collect()
     }
 }
 
@@ -83,16 +133,6 @@ impl WritableTimePartition {
             value: self.values_mmap.align_to(self.len),
         }
     }
-    pub fn get_stream_from_wal(&self, stream_id: u64) -> DatapointVec {
-        self.stream()
-            .iter()
-            .filter(|x| *x.stream_id == stream_id)
-            .map(|x| Datapoint {
-                unix_s: *x.timestamp,
-                value: *x.value,
-            })
-            .collect()
-    }
 }
 pub async fn get_writable_chart_aggregated(
     time_partition: Arc<RwLock<WritableTimePartition>>,
@@ -123,26 +163,25 @@ pub async fn get_writable_chart_aggregated(
                     *x = Some(stream.value[i + start_idx])
                 }
             }
-            let maybe_value = match agg {
-                Aggregation::Sum => stream_counter.values().cloned().sum(),
+            let values = stream_counter.values().filter_map(|&x| x);
+            let maybe_agged_value = match agg {
+                Aggregation::Sum => values.sum1(),
                 Aggregation::Avg => {
-                    let (sum, counter) = stream_counter
-                        .values()
-                        .filter_map(|&x| x)
-                        .fold((0_f32, 0), |(sum, count), x| (sum + x, count + 1));
+                    let (sum, counter) =
+                        values.fold((0_f32, 0), |(sum, count), x| (sum + x, count + 1));
                     match counter {
                         0 => None,
                         len => Some(sum / len as f32),
                     }
                 }
-                Aggregation::Min => stream_counter.values().filter_map(|&x| x).reduce(f32::min),
-                Aggregation::Max => stream_counter.values().filter_map(|&x| x).reduce(f32::max),
+                Aggregation::Min => values.reduce(f32::min),
+                Aggregation::Max => values.reduce(f32::max),
             };
             for v in stream_counter.values_mut() {
                 *v = None
             }
 
-            match maybe_value {
+            match maybe_agged_value {
                 None => None,
                 Some(value) => Some(Datapoint { unix_s, value }),
             }

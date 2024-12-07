@@ -19,55 +19,6 @@ impl ChartRequest {
     }
 }
 
-impl ValueTracker {
-    #[inline]
-    fn agg<F>(self, rhs: Self, agg_fn: &F) -> Self
-    where
-        F: Fn(f32, f32) -> f32,
-    {
-        Self {
-            value: agg_fn(self.value, rhs.value),
-            count: self.count + rhs.count,
-        }
-    }
-    #[inline]
-    fn apply<F>(self, rhs: f32, agg_fn: &F) -> Self
-    where
-        F: Fn(f32, f32) -> f32,
-    {
-        Self {
-            value: agg_fn(self.value, rhs),
-            count: self.count + 1,
-        }
-    }
-
-    #[inline]
-    fn default_final_agg_fn(self) -> f32 {
-        self.value
-    }
-    #[inline]
-    fn avg_final_agg(self) -> f32 {
-        self.value / self.count as f32
-    }
-}
-
-impl Aggregation {
-    fn to_agg_fn(&self) -> impl Fn(f32, f32) -> f32 {
-        match self {
-            Aggregation::Sum => std::ops::Add::add,
-            Aggregation::Avg => std::ops::Add::add,
-            Aggregation::Min => f32::min,
-            Aggregation::Max => f32::max,
-        }
-    }
-    fn to_final_agg(self) -> impl Fn(ValueTracker) -> f32 {
-        match self {
-            Aggregation::Avg => ValueTracker::avg_final_agg,
-            _ => ValueTracker::default_final_agg_fn,
-        }
-    }
-}
-
 impl ReadOnlyDiskStreamFileHeader {
     fn read_stream_from_compressed(&self, mmap: &Mmap) -> DatapointVec {
         let unix_s_bytes = &mmap[self.unix_s_byte_start..self.unix_s_byte_stop];

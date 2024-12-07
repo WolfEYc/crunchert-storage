@@ -7,11 +7,6 @@ use std::sync::Arc;
 use std::{collections::VecDeque, marker::PhantomData};
 use tokio::sync::RwLock;
 
-#[derive(Default, Debug, Clone, Copy)]
-pub struct ValueTracker {
-    pub value: f32,
-    pub count: u32,
-}
 #[derive(StructOfArray)]
 pub struct StreamPoint {
     pub timestamp: i64,
@@ -102,11 +97,6 @@ pub struct ResizableMmapMut<T> {
     pub file: tokio::fs::File,
     pub cap: usize,
     pub item: PhantomData<T>,
-}
-
-pub struct WritableStreamCache {
-    pub hs: RwLock<Option<DatapointVec>>,
-    pub count: usize,
 }
 
 pub struct WritableTimePartition {

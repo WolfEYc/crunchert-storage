@@ -1,5 +1,4 @@
 pub const PARTITIONS_FILE_HEADER_FILENAME: &str = "CruncheRTPartitionsConfig";
-pub const MIN_STREAMS_PER_THREAD: usize = 1024;
 pub const MIN_COMPRESSION_LEVEL: usize = 4;
 pub const MAX_COMPRESSION_LEVEL: usize = 12;
 pub const MIN_RETENTION_PERIOD_S: u64 = 3600; //1h

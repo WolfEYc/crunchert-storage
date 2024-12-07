@@ -1,6 +1,6 @@
 use itertools::Itertools;
 use pco::standalone::simpler_compress;
-use std::{io, sync::Arc};
+use std::{collections::HashMap, io, sync::Arc};
 use tokio::{io::AsyncWriteExt, sync::RwLock};
 
 use crate::models::*;
@@ -49,24 +49,37 @@ impl WritableTimePartition {
     ) -> Result<ReadOnlyTimePartitionFileHeader, io::Error> {
         let mut compressed_pts = Vec::new();
         let mut disk_streams = Vec::new();
-        for (&stream_id, cache) in &self.streams {
-            let readlock = cache.hs.read().await;
-            let hs = {
-                match *readlock {
-                    Some(ref hs) => hs,
-                    None => &self.get_stream_from_wal(stream_id),
-                }
-            };
+
+        let by_stream_id = {
+            let mut by_stream_id: HashMap<u64, DatapointVec> = HashMap::new();
+            for x in self.stream() {
+                by_stream_id
+                    .entry(*x.stream_id)
+                    .and_modify(|e| {
+                        e.push(Datapoint {
+                            unix_s: *x.timestamp,
+                            value: *x.value,
+                        })
+                    })
+                    .or_insert_with(|| DatapointVec {
+                        unix_s: vec![*x.timestamp],
+                        value: vec![*x.value],
+                    });
+            }
+            by_stream_id
+        };
+
+        for (stream_id, pts) in by_stream_id {
             let unix_s_byte_start = compressed_pts.len();
             {
                 let compressed_timestamps =
-                    simpler_compress(&hs.unix_s, config.compression_level).unwrap();
+                    simpler_compress(&pts.unix_s, config.compression_level).unwrap();
                 compressed_pts.extend_from_slice(&compressed_timestamps);
             }
             let unix_s_byte_stop = compressed_pts.len();
             {
                 let compressed_values =
-                    simpler_compress(&hs.value, config.compression_level).unwrap();
+                    simpler_compress(&pts.value, config.compression_level).unwrap();
                 compressed_pts.extend_from_slice(&compressed_values);
             }
             let values_byte_stop = compressed_pts.len();

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 impl ChartRequest {
-    fn resolution(&self) -> usize {
+    pub fn resolution(&self) -> usize {
         let duration_s = (self.stop_unix_s - self.start_unix_s) as u32;
         let resolution = duration_s / self.step_s;
         return resolution as usize;
@@ -168,10 +168,8 @@ pub async fn get_writable_chart_aggregated(
             last_idx = start_idx;
 
             for (i, stream_id) in stream.stream_id[start_idx..stop_idx].iter().enumerate() {
-                match stream_counter.get_mut(stream_id) {
-                    None => continue,
-                    Some(Some(_)) => continue,
-                    Some(none_ref) => *none_ref = Some(stream.value[i + start_idx]),
+                if let Some(x) = stream_counter.get_mut(stream_id) {
+                    *x = Some(stream.value[i + start_idx])
                 }
             }
             let maybe_value = match agg {

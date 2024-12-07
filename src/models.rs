@@ -68,6 +68,13 @@ pub struct ReadOnlyTimePartitionFileHeader {
     pub disk_streams: Vec<ReadOnlyDiskStreamFileHeader>,
 }
 
+pub struct ReadOnlyTimePartition {
+    pub start_unix_s: i64,
+    pub mmap: Mmap,
+    pub file: tokio::fs::File,
+    pub streams: HashMap<u64, ReadOnlyDiskStreamFileHeader>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct WritableTimePartitionFileHeader {
     pub start_unix_s: i64,
@@ -77,21 +84,6 @@ pub struct WritableTimePartitionFileHeader {
     pub stream_ids_file_path: PathBuf,
     pub values_file_path: PathBuf,
 }
-
-#[derive(Serialize, Deserialize)]
-pub struct PartitionsFileHeader {
-    // sorted descending start_unix_s
-    pub read_only_time_partitions: Vec<ReadOnlyTimePartitionFileHeader>,
-    pub writable_time_partitions: Vec<WritableTimePartitionFileHeader>,
-}
-
-pub struct ReadOnlyTimePartition {
-    pub start_unix_s: i64,
-    pub mmap: Mmap,
-    pub file: tokio::fs::File,
-    pub streams: HashMap<u64, ReadOnlyDiskStreamFileHeader>,
-}
-
 pub struct ResizableMmapMut<T> {
     pub mmap: MmapMut,
     pub file: tokio::fs::File,
@@ -105,6 +97,12 @@ pub struct WritableTimePartition {
     pub timestamps_mmap: ResizableMmapMut<i64>,
     pub streams_mmap: ResizableMmapMut<u64>,
     pub values_mmap: ResizableMmapMut<f32>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PartitionsFileHeader {
+    pub read_only_time_partitions: Vec<ReadOnlyTimePartitionFileHeader>,
+    pub writable_time_partitions: Vec<WritableTimePartitionFileHeader>,
 }
 
 pub struct Storage {

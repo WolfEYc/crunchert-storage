@@ -252,7 +252,7 @@ impl Storage {
         })
     }
 
-    async fn write_streams(&self, mut stream: ImportStream) {
+    async fn write_stream(&self, mut stream: ImportStream) {
         assert!(!stream.pts.is_empty());
 
         stream.pts.as_mut_slice().sort_by_key(|x| *x.timestamp);
@@ -355,8 +355,8 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn import_streams(&self, stream: ImportStream) -> Result<(), io::Error> {
-        self.write_streams(stream).await;
+    pub async fn import_stream(&self, stream: ImportStream) -> Result<(), io::Error> {
+        self.write_stream(stream).await;
 
         if self.need_new_writable_partition().await {
             self.start_next_stream().await?;

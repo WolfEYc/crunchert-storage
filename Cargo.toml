@@ -21,3 +21,6 @@ serde = { version = "1.0.210", features = ["derive"] }
 soa_derive = "0.13.0"
 thiserror = "1.0.64"
 tokio = { version = "1.40.0", features = ["full", "tracing"] }
+
+[dev-dependencies]
+tempfile = "3.14.0"

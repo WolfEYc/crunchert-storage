@@ -14,10 +14,6 @@ pub struct StreamPoint {
     pub value: f32,
 }
 
-pub struct ImportStream {
-    pub pts: StreamPointVec,
-}
-
 #[derive(Clone, Copy)]
 pub enum Aggregation {
     Sum,
@@ -110,5 +106,4 @@ pub struct Storage {
     pub partitions_file_header: RwLock<PartitionsFileHeader>,
     pub readonly_partitions: RwLock<Vec<Arc<ReadOnlyTimePartition>>>,
     pub writable_partitions: RwLock<VecDeque<Arc<RwLock<WritableTimePartition>>>>,
-    pub num_threads: usize,
 }

@@ -226,10 +226,7 @@ impl Storage {
             .unwrap_or(DatapointVec::default())
     }
 
-    pub async fn new(
-        config: StorageConfig,
-        num_threads: usize,
-    ) -> Result<Self, StorageCreationError> {
+    pub async fn new(config: StorageConfig) -> Result<Self, StorageCreationError> {
         let config = config.validate()?;
         let partitions_file_path = config.partitions_file_path();
         let partitions_file_header = if partitions_file_path.exists() {
@@ -248,14 +245,13 @@ impl Storage {
             partitions_file_header,
             readonly_partitions,
             writable_partitions,
-            num_threads,
         })
     }
 
-    async fn write_stream(&self, mut stream: ImportStream) {
-        assert!(!stream.pts.is_empty());
+    async fn write_stream(&self, mut stream: StreamPointVec) {
+        assert!(!stream.is_empty());
 
-        stream.pts.as_mut_slice().sort_by_key(|x| *x.timestamp);
+        stream.as_mut_slice().sort_by_key(|x| *x.timestamp);
         let writable_partitions = self.writable_partitions.read().await;
 
         assert!(writable_partitions.len() != 0);
@@ -265,18 +261,17 @@ impl Storage {
             let start_unix_s = partition.read().await.start_unix_s;
 
             let start_idx = stream
-                .pts
                 .timestamp
                 .binary_search(&start_unix_s)
                 .unwrap_or_else(|x| x);
 
-            if start_idx == stream.pts.len() {
+            if start_idx == stream.len() {
                 break;
             }
 
-            let stream_pts = stream.pts.split_off(start_idx);
+            let stream_pts = stream.split_off(start_idx);
             import_joinset.spawn(write_stream(partition.clone(), stream_pts));
-            if stream.pts.is_empty() {
+            if stream.is_empty() {
                 break;
             }
         }
@@ -355,7 +350,7 @@ impl Storage {
         Ok(())
     }
 
-    pub async fn import_stream(&self, stream: ImportStream) -> Result<(), io::Error> {
+    pub async fn import_stream(&self, stream: StreamPointVec) -> Result<(), io::Error> {
         self.write_stream(stream).await;
 
         if self.need_new_writable_partition().await {

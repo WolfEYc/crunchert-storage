@@ -106,7 +106,7 @@ impl WritableTimePartitionFileHeader {
         let start_unix_s = self.start_unix_s;
         let start_ts = DateTime::from_timestamp(start_unix_s, 0).unwrap();
         info!("new writable partition materialized start_ts={start_ts}");
-        dbg!(self.len);
+
         Ok(WritableTimePartition {
             start_unix_s,
             timestamps_mmap: timestamps_mmap?,

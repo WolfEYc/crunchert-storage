@@ -49,7 +49,7 @@ mod tests {
         let res = storage.get_agg_chart(req, Aggregation::Sum).await;
 
         for x in res.into_iter() {
-            dbg!(x.to_owned());
+            println!("{0}, {1}", x.unix_s, x.value);
         }
     }
 }

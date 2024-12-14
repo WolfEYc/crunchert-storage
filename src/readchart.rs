@@ -108,7 +108,7 @@ impl ReadOnlyTimePartition {
 impl<T> ResizableMmapMut<T> {
     fn align_to(&self, len: usize) -> &[T] {
         unsafe {
-            let (_, res, _) = self.mmap[..len].align_to();
+            let (_, res, _) = self.mmap[..len * size_of::<T>()].align_to();
             res
         }
     }

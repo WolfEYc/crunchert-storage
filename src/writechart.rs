@@ -1,7 +1,7 @@
 use itertools::Itertools;
 use pco::standalone::simpler_compress;
-use std::{collections::HashMap, io, sync::Arc};
-use tokio::{io::AsyncWriteExt, sync::RwLock};
+use std::{collections::HashMap, io};
+use tokio::io::AsyncWriteExt;
 
 use crate::models::*;
 
@@ -27,22 +27,15 @@ impl PartialOrd for StreamPoint {
 }
 
 impl<T> ResizableMmapMut<T> {
-    fn align_to_mut(&mut self, len: usize) -> &mut [T] {
+    fn align_to_mut(&mut self) -> &mut [T] {
         unsafe {
-            let (_, res, _) = self.mmap[..len].align_to_mut();
+            let (_, res, _) = self.mmap.align_to_mut();
             res
         }
     }
 }
 
 impl WritableTimePartition {
-    fn stream_mut(&mut self) -> StreamPointSliceMut {
-        StreamPointSliceMut {
-            timestamp: self.timestamps_mmap.align_to_mut(self.len),
-            stream_id: self.streams_mmap.align_to_mut(self.len),
-            value: self.values_mmap.align_to_mut(self.len),
-        }
-    }
     pub async fn freeze(
         &self,
         config: &StorageConfig,
@@ -93,8 +86,8 @@ impl WritableTimePartition {
 
         let file_path = config
             .data_storage_dir
-            .join(self.start_unix_s.to_string())
-            .join("_readonly");
+            .join("readonly")
+            .join(self.start_unix_s.to_string());
         {
             let mut file = tokio::fs::OpenOptions::new()
                 .write(true)
@@ -113,70 +106,39 @@ impl WritableTimePartition {
 
         Ok(file_header)
     }
-}
 
-pub async fn write_stream(
-    partition: Arc<RwLock<WritableTimePartition>>,
-    mut stream: StreamPointVec,
-) {
-    let last_idx: usize;
-    let first_idx: usize;
-    {
-        let start_ts = *stream.timestamp.first().unwrap();
-        let end_ts = *stream.timestamp.last().unwrap();
-
-        let readable_partition = partition.read().await;
-        let readable_stream = readable_partition.stream();
-
-        first_idx = readable_stream
+    pub async fn write_stream(&mut self, mut stream: StreamPointVec) {
+        let first_pt = *stream.timestamp.first().unwrap();
+        let partition_stream = self.stream();
+        let pp = partition_stream
             .timestamp
-            .iter()
-            .cloned()
-            .rposition(|x| x <= start_ts)
-            .unwrap_or(0);
-        last_idx = readable_stream
-            .timestamp
-            .iter()
-            .cloned()
-            .rposition(|x| x < end_ts)
-            .unwrap_or(0);
-        assert!(first_idx <= last_idx);
+            .partition_point(|&x| x < first_pt);
 
-        if first_idx < last_idx {
-            let range = first_idx..=last_idx;
-            let readable_stream_merge_pts = readable_stream.index(range);
-            let owned_merge_pts = readable_stream_merge_pts.iter().map(|x| x.to_owned());
-            stream = stream
-                .into_iter()
-                .map(|x| x.to_owned())
-                .merge(owned_merge_pts)
-                .collect();
-        }
-    }
+        let partition_stream = partition_stream.index(pp..);
 
-    {
-        let mut writable_partition = partition.write().await;
-        if stream.len() > writable_partition.pts_free() {
-            return;
-        }
-        let r_offset_count = writable_partition.len - last_idx - 1;
-        let prev_len = writable_partition.len;
-        writable_partition.len += stream.len();
+        stream = stream
+            .into_iter()
+            .merge_join_by(partition_stream, |i, j| {
+                i.timestamp
+                    .cmp(&j.timestamp)
+                    .then_with(|| i.stream_id.cmp(&j.stream_id))
+            })
+            .map(|x| match x {
+                itertools::EitherOrBoth::Both(_, r) => r,
+                itertools::EitherOrBoth::Left(l) => l,
+                itertools::EitherOrBoth::Right(r) => r,
+            })
+            .map(|x| x.to_owned())
+            .collect();
 
-        let dest = writable_partition.len - r_offset_count;
-        let writable_streams = writable_partition.stream_mut();
-
-        if r_offset_count > 0 {
-            // need to memmove the pts to the right of the insertion block
-            let src = last_idx..prev_len;
-            writable_streams.timestamp.copy_within(src.clone(), dest);
-            writable_streams.stream_id.copy_within(src.clone(), dest);
-            writable_streams.value.copy_within(src, dest);
-        }
-
-        let src = first_idx..first_idx + stream.len();
-        writable_streams.timestamp[src.clone()].copy_from_slice(&stream.timestamp);
-        writable_streams.stream_id[src.clone()].copy_from_slice(&stream.stream_id);
-        writable_streams.value[src].copy_from_slice(&stream.value);
+        let new_len = self.len + stream.len();
+        let src = pp..new_len;
+        let timestamps = self.timestamps_mmap.align_to_mut();
+        timestamps[src.clone()].copy_from_slice(&stream.timestamp);
+        let stream_ids = self.streams_mmap.align_to_mut();
+        stream_ids[src.clone()].copy_from_slice(&stream.stream_id);
+        let values = self.values_mmap.align_to_mut();
+        values[src.clone()].copy_from_slice(&stream.value);
+        self.len = new_len;
     }
 }

@@ -76,13 +76,11 @@ pub struct WritableTimePartitionFileHeader {
     pub start_unix_s: i64,
     pub len: usize,
     pub cap: usize,
-    pub timestamps_file_path: PathBuf,
-    pub stream_ids_file_path: PathBuf,
-    pub values_file_path: PathBuf,
 }
 pub struct ResizableMmapMut<T> {
     pub mmap: MmapMut,
     pub file: tokio::fs::File,
+    pub filepath: PathBuf,
     pub cap: usize,
     pub item: PhantomData<T>,
 }
@@ -93,12 +91,18 @@ pub struct WritableTimePartition {
     pub timestamps_mmap: ResizableMmapMut<i64>,
     pub streams_mmap: ResizableMmapMut<u64>,
     pub values_mmap: ResizableMmapMut<f32>,
+    pub marked_for_delete_at: Option<i64>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct PartitionsFileHeader {
     pub read_only_time_partitions: Vec<ReadOnlyTimePartitionFileHeader>,
     pub writable_time_partitions: Vec<WritableTimePartitionFileHeader>,
+}
+
+pub struct WritableGCResult {
+    pub start_unix_s: i64,
+    pub result: Result<(), tokio::io::Error>,
 }
 
 pub struct Storage {

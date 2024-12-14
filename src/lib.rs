@@ -10,16 +10,17 @@ pub use models::{Aggregation, ChartRequest, Datapoint, Storage};
 
 #[cfg(test)]
 mod tests {
-    use chrono::{Duration, Utc};
+    use chrono::Utc;
     use models::*;
 
     use super::*;
 
     #[tokio::test]
     async fn basic_storage_creation_write_and_read_sync() {
+        tracing_subscriber::fmt::init();
         let tempdir = tempfile::tempdir().unwrap();
         let config = StorageConfig {
-            data_storage_dir: tempdir.into_path(),
+            data_storage_dir: tempdir.path().to_owned(),
             ..Default::default()
         };
         let storage = Storage::new(config).await.unwrap();

@@ -76,7 +76,10 @@ impl ReadOnlyTimePartitionFileHeader {
 }
 impl WritableTimePartitionFileHeader {
     async fn new(config: &StorageConfig, start_unix_s: i64) -> Result<Self, io::Error> {
-        let file_path = config.data_storage_dir.join(start_unix_s.to_string());
+        let file_path = config
+            .data_storage_dir
+            .join("writable")
+            .join(start_unix_s.to_string());
         tokio::fs::create_dir_all(file_path.as_path()).await?;
         info!("new writable partition dir {:?}", file_path);
         let cap = config.writable_partition_bytes / size_of::<StreamPoint>();
@@ -342,7 +345,7 @@ impl Storage {
             let stream_pts = stream.split_off(start_idx);
             import_joinset.spawn(async move {
                 let mut writelock = partition.write().await;
-                writelock.write_stream(stream_pts).await;
+                writelock.write_stream(stream_pts);
             });
 
             if stream.is_empty() {

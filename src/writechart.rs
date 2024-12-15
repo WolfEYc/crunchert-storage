@@ -107,7 +107,7 @@ impl WritableTimePartition {
         Ok(file_header)
     }
 
-    pub async fn write_stream(&mut self, mut stream: StreamPointVec) {
+    pub fn write_stream(&mut self, mut stream: StreamPointVec) {
         let first_pt = *stream.timestamp.first().unwrap();
         let partition_stream = self.stream();
         let pp = partition_stream
